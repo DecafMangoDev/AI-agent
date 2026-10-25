@@ -1,4 +1,3 @@
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -189,6 +188,8 @@ class ReviewRegressionTest(unittest.TestCase):
     def test_fault_point_creates_unknown_and_retry_executes(self):
         from unittest.mock import patch
 
+        from agent.runtime import InjectedFault
+
         root, store = self.make()
         model = FakeModel(
             [
@@ -199,13 +200,23 @@ class ReviewRegressionTest(unittest.TestCase):
             ]
         )
         runtime = AgentRuntime(model, store, str(root))
-        with patch.dict("os.environ", {"AGENT_FAULT_AFTER_TOOL_ID": "c"}):
+        original_execute = runtime._execute_call
+
+        def execute_then_interrupt(call, registry, plan_mode, force_retry=False):
+            original_execute(call, registry, plan_mode, force_retry)
+            store.db.execute(
+                "UPDATE calls SET status='started', result_json=NULL WHERE run_id=? AND call_id=?",
+                (runtime.run_id, call.id),
+            )
+            raise InjectedFault("fault injected after tool execution")
+
+        with patch.object(runtime, "_execute_call", side_effect=execute_then_interrupt):
             with self.assertRaises(RuntimeError):
                 runtime.start("x")
         self.assertEqual((root / "a.txt").read_text(), "new")
         self.assertEqual(store.call(runtime.run_id, "c")["status"], "started")
-        os.environ.pop("AGENT_FAULT_AFTER_TOOL_ID", None)
-        self.assertEqual(runtime.resume(), "done")
+        self.assertIn("unknown calls detected", runtime.resume())
+        self.assertEqual(runtime.resolve("c", "retry"), "done")
 
     def test_rejected_plan_cannot_be_approved(self):
         root, store = self.make()
@@ -306,3 +317,30 @@ class TaskExecutionTest(unittest.TestCase):
         runtime.start("plan", plan=True)
         self.assertEqual(runtime.approve(), "готово")
         self.assertEqual(store.tasks(runtime.run_id)[0]["status"], "done")
+
+    def test_task_review_rejection_returns_feedback_to_model(self):
+        import json
+
+        root = Path(tempfile.mkdtemp())
+        (root / "a.txt").write_text("old", encoding="utf-8")
+        store = Store(str(root / "state.sqlite3"))
+        plan = {"goal": "inspect", "steps": [{"id": "step_1", "description": "read", "depends_on": []}]}
+        model = FakeModel(
+            [
+                AssistantTurn(json.dumps(plan), []),
+                AssistantTurn("", [ToolCall("first", "read_file", {"path": "a.txt"})]),
+                AssistantTurn("готово", []),
+                AssistantTurn("", [ToolCall("second", "read_file", {"path": "a.txt"})]),
+                AssistantTurn("готово после доработки", []),
+            ]
+        )
+        reviews = iter([(False, "нужна доработка"), (True, "")])
+        runtime = AgentRuntime(model, store, str(root), review=lambda _task, _result: next(reviews))
+        runtime.start("plan", plan=True)
+        self.assertEqual(runtime.approve(), "готово после доработки")
+        task = store.tasks(runtime.run_id)[0]
+        self.assertEqual(task["status"], "done")
+        self.assertEqual(task["completed_call_id"], "second")
+        self.assertTrue(
+            any("нужна доработка" in message["content"] for message in store.messages(runtime.run_id))
+        )

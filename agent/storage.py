@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS runs (run_id TEXT PRIMARY KEY, workspace TEXT NOT NUL
 CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT, tool_call_id TEXT, name TEXT, payload_json TEXT NOT NULL, FOREIGN KEY(run_id) REFERENCES runs(run_id));
 CREATE TABLE IF NOT EXISTS calls (run_id TEXT NOT NULL, call_id TEXT NOT NULL, name TEXT NOT NULL, args_json TEXT NOT NULL, status TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 1, result_json TEXT, task_id TEXT, PRIMARY KEY(run_id, call_id, attempt));
 CREATE TABLE IF NOT EXISTS budgets (run_id TEXT PRIMARY KEY, model_limit INTEGER, model_used INTEGER NOT NULL, tool_limit INTEGER, tool_used INTEGER NOT NULL, effect_limit INTEGER, effect_used INTEGER NOT NULL, result_limit INTEGER, result_used INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS tasks (run_id TEXT NOT NULL, task_id TEXT NOT NULL, description TEXT NOT NULL, deps_json TEXT NOT NULL, status TEXT NOT NULL, evidence_json TEXT, PRIMARY KEY(run_id, task_id));
+CREATE TABLE IF NOT EXISTS tasks (run_id TEXT NOT NULL, task_id TEXT NOT NULL, description TEXT NOT NULL, deps_json TEXT NOT NULL, status TEXT NOT NULL, evidence_json TEXT, last_call_id TEXT, completed_call_id TEXT, review_comment TEXT, PRIMARY KEY(run_id, task_id));
 CREATE TABLE IF NOT EXISTS snapshots (run_id TEXT NOT NULL, seq INTEGER NOT NULL, tree_json TEXT NOT NULL, PRIMARY KEY(run_id, seq));
 CREATE TABLE IF NOT EXISTS changes (run_id TEXT NOT NULL, path TEXT NOT NULL, original TEXT, final TEXT, original_hash TEXT, final_hash TEXT, diff TEXT, PRIMARY KEY(run_id, path));
 CREATE TABLE IF NOT EXISTS decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, created_at REAL NOT NULL);
@@ -31,6 +31,10 @@ class Store:
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(calls)")}
         if "task_id" not in columns:
             self.db.execute("ALTER TABLE calls ADD COLUMN task_id TEXT")
+        task_columns = {row[1] for row in self.db.execute("PRAGMA table_info(tasks)")}
+        for name in ("last_call_id", "completed_call_id", "review_comment"):
+            if name not in task_columns:
+                self.db.execute("ALTER TABLE tasks ADD COLUMN {} TEXT".format(name))
 
     def close(self) -> None:
         self.db.close()
@@ -208,8 +212,8 @@ class Store:
 
     def add_task(self, run_id: str, task_id: str, description: str, deps: Iterable[str]) -> None:
         self.db.execute(
-            "INSERT OR REPLACE INTO tasks VALUES(?,?,?,?,?,?)",
-            (run_id, task_id, description, json.dumps(list(deps)), "pending", None),
+            "INSERT OR REPLACE INTO tasks(run_id,task_id,description,deps_json,status,evidence_json,last_call_id,completed_call_id,review_comment) VALUES(?,?,?,?,?,?,?,?,?)",
+            (run_id, task_id, description, json.dumps(list(deps)), "pending", None, None, None, None),
         )
 
     def tasks(self, run_id: str) -> List[sqlite3.Row]:
@@ -222,3 +226,33 @@ class Store:
             "UPDATE tasks SET status=?, evidence_json=? WHERE run_id=? AND task_id=?",
             (status, None if evidence is None else json.dumps(evidence), run_id, task_id),
         )
+
+    def task_progress(self, run_id: str, task_id: str, call_id: str) -> None:
+        self.db.execute(
+            "UPDATE tasks SET status='running', last_call_id=? WHERE run_id=? AND task_id=?",
+            (call_id, run_id, task_id),
+        )
+
+    def task_review(self, run_id: str, task_id: str, accepted: bool, comment: str = "") -> None:
+        row = self.db.execute(
+            "SELECT last_call_id FROM tasks WHERE run_id=? AND task_id=?", (run_id, task_id)
+        ).fetchone()
+        if not row or not row["last_call_id"]:
+            raise RuntimeError("task has no successful tool result to review")
+        self.db.execute(
+            "UPDATE tasks SET status=?, last_call_id=?, completed_call_id=?, review_comment=? WHERE run_id=? AND task_id=?",
+            (
+                "done" if accepted else "running",
+                row["last_call_id"] if accepted else None,
+                row["last_call_id"] if accepted else None,
+                comment or None,
+                run_id,
+                task_id,
+            ),
+        )
+
+    def task_candidate(self, run_id: str) -> Optional[sqlite3.Row]:
+        return self.db.execute(
+            "SELECT * FROM tasks WHERE run_id=? AND status='running' AND last_call_id IS NOT NULL ORDER BY task_id LIMIT 1",
+            (run_id,),
+        ).fetchone()

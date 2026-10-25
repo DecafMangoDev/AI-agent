@@ -3,17 +3,65 @@
 from __future__ import annotations
 
 import json
-import os
 import uuid
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from .client import ModelClient, ToolCall
 from .storage import Store
 from .tools import ToolError, ToolRegistry, _hash, _path
 
-SYSTEM = """Ты coding agent. Исследуй workspace инструментами. Не меняй тесты. Для каждого шага используй инструменты, а когда задача проверена, ответь кратко. Пути должны быть относительными workspace."""
-PLAN_SYSTEM = """Ты планировщик coding agent. Используй только инструменты чтения. В финальном ответе верни JSON с полями goal, steps (массив объектов {id, description, tools, depends_on}), risks, assumptions, ready_when."""
+SYSTEM = """You are a general-purpose assistant. Answer ordinary questions and hold a conversation directly.
+Use workspace tools only when the user asks to work with code, files, commands, or the project.
+Do not inspect the workspace for greetings or general questions. Do not change tests.
+Paths must be relative to the workspace. Briefly report the result after completing work."""
+PLAN_SYSTEM = """You are a coding agent planner. Use read-only tools only. Return final JSON with goal, steps (objects with id, description, tools, depends_on), risks, assumptions, and ready_when."""
 DEFAULT_LIMITS = {"model": 20, "tools": 40, "effects": 15, "result": 120000}
+
+
+def _needs_tools(prompt: str) -> bool:
+    """Recognize clear workspace requests before exposing side-effecting tools to the model."""
+    text = prompt.lower()
+    markers = (
+        "код",
+        "файл",
+        "проект",
+        "тест",
+        "репозитор",
+        "workspace",
+        "code",
+        "file",
+        "project",
+        "test",
+        "bug",
+        "error",
+        "implement",
+        "refactor",
+        "fix",
+        "inspect",
+        "show",
+        "create",
+        "modify",
+        "delete",
+        "execute",
+        "directory",
+        "folder",
+        "read",
+        "write",
+        "change",
+        "run",
+        "исправ",
+        "измени",
+        "посмотр",
+        "покаж",
+        "создай",
+        "удали",
+        "добавь",
+        "сделай",
+        "запусти",
+    )
+    return any(marker in text for marker in markers) or any(
+        token in text for token in ("/", ".py", ".txt", ".json", "pytest", "unittest")
+    )
 
 
 class InjectedFault(RuntimeError):
@@ -29,6 +77,7 @@ class AgentRuntime:
         run_id: Optional[str] = None,
         limits: Optional[Dict[str, int]] = None,
         progress: Optional[Callable[[str], None]] = None,
+        review: Optional[Callable[[str, Dict[str, Any]], Tuple[bool, str]]] = None,
     ):
         self.client = client
         self.store = store
@@ -36,19 +85,72 @@ class AgentRuntime:
         self.run_id = run_id or uuid.uuid4().hex
         self.limits = limits or DEFAULT_LIMITS.copy()
         self.progress = progress or (lambda _message: None)
+        self.review = review
+        self._tools_enabled = True
 
     def _progress(self, message: str) -> None:
         """Publish a short event for interactive clients without coupling core to stdout."""
         self.progress(message)
 
+    def _budget_remaining(self) -> str:
+        """Format the persisted remaining budget for human-readable progress events."""
+        row = self.store.budget(self.run_id)
+        if row is None:
+            return "budget is not initialized"
+        return "model={}, tools={}, effects={}, result={} bytes".format(
+            row["model_limit"] - row["model_used"],
+            row["tool_limit"] - row["tool_used"],
+            row["effect_limit"] - row["effect_used"],
+            row["result_limit"] - row["result_used"],
+        )
+
+    def _review_candidate(self, task: Any) -> bool:
+        """Ask the interactive client to accept the latest successful task result."""
+        task_id = task["task_id"]
+        call = self.store.call(self.run_id, task["last_call_id"])
+        result = json.loads(call["result_json"]) if call and call["result_json"] else {}
+        review_payload = {
+            "tool": call["name"] if call else "unknown",
+            "arguments": json.loads(call["args_json"]) if call else {},
+            "result": result,
+        }
+        accepted, comment = (True, "") if self.review is None else self.review(task_id, review_payload)
+        self.store.add_decision(
+            self.run_id,
+            "task_review",
+            json.dumps(
+                {"task_id": task_id, "call_id": task["last_call_id"], "accepted": accepted, "comment": comment},
+                ensure_ascii=False,
+            ),
+        )
+        self.store.task_review(self.run_id, task_id, accepted, comment)
+        if accepted:
+            self._progress("[run {}] task {} accepted by user".format(self.run_id[:8], task_id))
+            self.store.update_run(self.run_id, status="active", error=None)
+            return True
+        self.store.add_message(
+            self.run_id,
+            "user",
+            {
+                "role": "user",
+                "content": "Task {} was rejected by the user: {}. Rework the task.".format(
+                    task_id, comment or "further work is needed"
+                ),
+            },
+        )
+        self._progress("[run {}] task {} sent back for rework".format(self.run_id[:8], task_id))
+        self.store.update_run(self.run_id, status="active", error=None)
+        return False
+
     def start(self, prompt: str, plan: bool = False) -> str:
-        self._progress("[run {}] запуск{}".format(self.run_id[:8], " планирования" if plan else ""))
+        self._progress("[run {}] starting{}".format(self.run_id[:8], " planning" if plan else ""))
         self.store.create_run(self.run_id, self.workspace, "planning" if plan else "executing")
         self.store.set_budget(self.run_id, self.limits)
         self.store.add_message(
             self.run_id, "system", {"role": "system", "content": PLAN_SYSTEM if plan else SYSTEM}
         )
         self.store.add_message(self.run_id, "user", {"role": "user", "content": prompt})
+        self._tools_enabled = plan or _needs_tools(prompt)
         return self._planning() if plan else self._safe_loop(False)
 
     def continue_prompt(self, prompt: str) -> str:
@@ -59,7 +161,8 @@ class AgentRuntime:
             raise RuntimeError("cannot continue a {} run".format(row["status"]))
         self.store.update_run(self.run_id, status="active", phase="executing", error=None)
         self.store.add_message(self.run_id, "user", {"role": "user", "content": prompt})
-        self._progress("[run {}] продолжаю запрос".format(self.run_id[:8]))
+        self._tools_enabled = _needs_tools(prompt)
+        self._progress("[run {}] continuing request".format(self.run_id[:8]))
         return self._safe_loop(False)
 
     def reject(self) -> str:
@@ -83,7 +186,7 @@ class AgentRuntime:
                 self.run_id, step["id"], step["description"], step.get("depends_on", [])
             )
         self.store.add_message(
-            self.run_id, "user", {"role": "user", "content": "План утверждён. Выполняй его."}
+            self.run_id, "user", {"role": "user", "content": "Plan approved. Execute it."}
         )
         return self._safe_loop(False)
 
@@ -116,7 +219,7 @@ class AgentRuntime:
                 last_error = str(exc)
                 if attempt == 2:
                     raise RuntimeError(
-                        "модель не смогла выдать корректный план после 3 попыток: " + last_error
+                        "the model could not produce a valid plan after 3 attempts: " + last_error
                     )
                 self.store.add_message(
                     self.run_id,
@@ -124,18 +227,18 @@ class AgentRuntime:
                     {
                         "role": "user",
                         "content": (
-                            "План отклонён runtime: {}. Верни исправленный JSON-план. "
-                            "Каждый шаг обязан иметь уникальный строковый id, а depends_on "
-                            "должен ссылаться только на существующие id."
+                            "Plan rejected by the runtime: {}. Return corrected plan JSON. "
+                            "Each step must have a unique string id, and depends_on must "
+                            "reference existing ids."
                         ).format(last_error),
                     },
                 )
                 continue
             self.store.save_plan(self.run_id, plan)
             self.store.update_run(self.run_id, phase="planning", status="waiting_approval")
-            self._progress("[run {}] план готов: {} задач; ожидается approve".format(self.run_id[:8], len(plan["steps"])))
+            self._progress("[run {}] plan ready: {} tasks; approval required".format(self.run_id[:8], len(plan["steps"])))
             return json.dumps(plan, ensure_ascii=False, indent=2)
-        raise RuntimeError("план не сформирован: " + str(last_error))
+        raise RuntimeError("plan was not created: " + str(last_error))
 
     def _parse_plan(self, text: str) -> Dict[str, Any]:
         try:
@@ -145,7 +248,7 @@ class AgentRuntime:
         except ValueError:
             pass
         return {
-            "goal": "Выполнить запрос пользователя",
+            "goal": "Complete the user's request",
             "steps": [
                 {
                     "id": "execute",
@@ -156,7 +259,7 @@ class AgentRuntime:
             ],
             "risks": [],
             "assumptions": [],
-            "ready_when": "Тесты проходят",
+            "ready_when": "Tests pass",
         }
 
     def _loop(self, plan_mode: bool) -> str:
@@ -164,8 +267,13 @@ class AgentRuntime:
         idle_turns = 0
         while True:
             self.store.reserve(self.run_id, "model")
-            self._progress("[run {}] запрос к модели (лимит использован)".format(self.run_id[:8]))
-            turn = self.client.complete(self.store.messages(self.run_id), registry.definitions())
+            self._progress(
+                "[run {}] model request; remaining: {}".format(
+                    self.run_id[:8], self._budget_remaining()
+                )
+            )
+            tools = registry.definitions() if (plan_mode or self._tools_enabled) else []
+            turn = self.client.complete(self.store.messages(self.run_id), tools)
             assistant: Dict[str, Any] = {"role": "assistant", "content": turn.content}
             if turn.tool_calls:
                 assistant["tool_calls"] = [
@@ -178,21 +286,26 @@ class AgentRuntime:
                 ]
             self.store.add_message(self.run_id, "assistant", assistant)
             if not turn.tool_calls:
+                candidate = self.store.task_candidate(self.run_id) if not plan_mode else None
+                if candidate is not None:
+                    self.store.update_run(self.run_id, status="waiting_review", error=None)
+                    if not self._review_candidate(candidate):
+                        continue
                 pending = [
                     task for task in self.store.tasks(self.run_id) if task["status"] != "done"
                 ]
                 if not plan_mode and pending:
                     idle_turns += 1
                     if idle_turns > 3:
-                        raise RuntimeError("модель не начала выполнять незавершённые задачи")
+                        raise RuntimeError("the model did not start the pending tasks")
                     self.store.add_message(
                         self.run_id,
                         "user",
                         {
                             "role": "user",
                             "content": (
-                                "У тебя есть незавершённые задачи: {}. Не выводи план и не отвечай текстом. "
-                                "Сейчас вызови подходящий инструмент для первой доступной задачи."
+                                "Pending tasks: {}. Do not return a plan or text. "
+                                "Call a suitable tool for the first available task now."
                             ).format(", ".join(task["task_id"] for task in pending)),
                         },
                     )
@@ -229,7 +342,6 @@ class AgentRuntime:
                 self.run_id, {"tools": len(turn.tool_calls), "effects": effects}, starts
             )
             for call in turn.tool_calls:
-                self._progress("[run {}] инструмент: {}".format(self.run_id[:8], call.name))
                 result = self._execute_call(call, registry, plan_mode)
                 self.store.add_message(
                     self.run_id,
@@ -243,6 +355,11 @@ class AgentRuntime:
                     call.id,
                     call.name,
                 )
+            if not plan_mode:
+                candidate = self.store.task_candidate(self.run_id)
+                if candidate is not None:
+                    self.store.update_run(self.run_id, status="waiting_review", error=None)
+                    self._review_candidate(candidate)
 
     def _execute_call(
         self, call: ToolCall, registry: ToolRegistry, plan_mode: bool, force_retry: bool = False
@@ -265,6 +382,12 @@ class AgentRuntime:
             self.store.record_call(
                 self.run_id, call.id, call.name, call.arguments, "started", attempt, task_id=task_id
             )
+        arguments = json.dumps(call.arguments, ensure_ascii=False, sort_keys=True)
+        self._progress(
+            "[run {}] tool: {}({}); remaining: {}".format(
+                self.run_id[:8], call.name, arguments[:500], self._budget_remaining()
+            )
+        )
         try:
             result = registry.execute(call.name, call.arguments, plan_mode)
         except InjectedFault:
@@ -274,9 +397,6 @@ class AgentRuntime:
             status = "failed"
         else:
             status = "succeeded"
-        fault_id = os.environ.get("AGENT_FAULT_AFTER_TOOL_ID")
-        if fault_id and fault_id == call.id:
-            raise InjectedFault("fault injected after tool execution")
         result = self._fit_result(result)
         self.store.record_call(
             self.run_id,
@@ -289,16 +409,21 @@ class AgentRuntime:
             task_id,
         )
         if task_id and status == "succeeded":
-            self.store.task_status(
-                self.run_id, task_id, "done", {"tool_call_id": call.id, "result": result}
+            self.store.task_progress(self.run_id, task_id, call.id)
+            self._progress("[run {}] task {} is awaiting review".format(self.run_id[:8], task_id))
+        result_preview = json.dumps(result, ensure_ascii=False, sort_keys=True)
+        if len(result_preview) > 800:
+            result_preview = result_preview[:800] + "…"
+        self._progress(
+            "[run {}] {}: {}; result: {}; remaining: {}".format(
+                self.run_id[:8], call.name, status, result_preview, self._budget_remaining()
             )
-            self._progress("[run {}] задача {} отмечена выполненной".format(self.run_id[:8], task_id))
-        self._progress("[run {}] {}: {}".format(self.run_id[:8], call.name, status))
+        )
         return result
 
     def _current_task_id(self) -> Optional[str]:
         for task in self.store.tasks(self.run_id):
-            if task["status"] != "pending":
+            if task["status"] not in {"pending", "running"}:
                 continue
             dependencies = json.loads(task["deps_json"])
             statuses = {row["task_id"]: row["status"] for row in self.store.tasks(self.run_id)}
@@ -332,7 +457,12 @@ class AgentRuntime:
             return "run already finished: " + row["status"]
         if row["status"] == "waiting_approval":
             plan = self.store.plan(self.run_id)
-            return json.dumps(plan, ensure_ascii=False, indent=2) if plan else "план ожидает approve"
+            return json.dumps(plan, ensure_ascii=False, indent=2) if plan else "plan is awaiting approval"
+        if row["status"] == "waiting_review":
+            candidate = self.store.task_candidate(self.run_id)
+            if candidate is not None and not self._review_candidate(candidate):
+                return self._safe_loop(False)
+        unknown_ids = []
         for call in self.store.db.execute(
             "SELECT * FROM calls WHERE run_id=? AND status='started'", (self.run_id,)
         ):
@@ -340,7 +470,13 @@ class AgentRuntime:
                 "UPDATE calls SET status='unknown' WHERE run_id=? AND call_id=? AND attempt=?",
                 (self.run_id, call["call_id"], call["attempt"]),
             )
-        self._progress("[run {}] восстановление состояния".format(self.run_id[:8]))
+            if call["call_id"] not in unknown_ids:
+                unknown_ids.append(call["call_id"])
+        if unknown_ids:
+            return "unknown calls detected: {}. Choose retry, fail, or abort.".format(
+                ", ".join(unknown_ids)
+            )
+        self._progress("[run {}] recovering state".format(self.run_id[:8]))
         return self._safe_loop(row["phase"] == "planning")
 
     def resolve(self, call_id: str, action: str) -> str:

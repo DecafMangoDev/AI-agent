@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shlex
 import sys
 from typing import List, Optional
@@ -30,12 +31,12 @@ def _configure_utf8() -> None:
 
 
 def _parser() -> FriendlyArgumentParser:
-    parser = FriendlyArgumentParser(description="Coding agent — интерактивные возобновляемые чаты")
+    parser = FriendlyArgumentParser(description="General purpose agent — interactive resumable chats")
     parser.add_argument("--workspace", default="workspace")
     parser.add_argument("--state", default=".agent/state.sqlite3")
-    parser.add_argument("--config", default="agent.toml", help="файл лимитов [limits]")
-    parser.add_argument("--resume", nargs="?", const="latest", help="продолжить чат при запуске")
-    parser.add_argument("--plan", action="store_true", help="включить Plan Mode для нового чата")
+    parser.add_argument("--config", default="agent.toml", help="limits file [limits]")
+    parser.add_argument("--resume", nargs="?", const="latest", help="resume a chat on startup")
+    parser.add_argument("--plan", action="store_true", help="enable Plan Mode for a new chat")
     parser.add_argument("--model")
     parser.add_argument("--base-url")
     return parser
@@ -45,17 +46,94 @@ def _progress(message: str) -> None:
     print("\r" + message + "\033[K", file=sys.stderr, flush=True)
 
 
+def _read_prompt() -> str:
+    return input().strip()
+
+
+def _review_task(task_id: str, payload) -> tuple:
+    print("\nTask {} completed technically.".format(task_id))
+    tool = payload.get("tool", "unknown")
+    arguments = json.dumps(payload.get("arguments", {}), ensure_ascii=False, sort_keys=True)
+    result = json.dumps(payload.get("result", {}), ensure_ascii=False)
+    print("Call: {}({})".format(tool, arguments[:1000]))
+    print("Result: {}".format(result[:2000] + ("…" if len(result) > 2000 else "")))
+    print("Is this result acceptable? [y/N] ", end="", flush=True)
+    accepted = _read_prompt().lower() in {"y", "yes", "да", "д"}
+    if accepted:
+        return True, ""
+    print("What should be improved? ", end="", flush=True)
+    return False, _read_prompt()
+
+
 def _new_runtime(client, store: Store, args, run_id: Optional[str] = None) -> AgentRuntime:
-    return AgentRuntime(client, store, args.workspace, run_id=run_id, limits=load_limits(args.config), progress=_progress)
+    return AgentRuntime(
+        client,
+        store,
+        args.workspace,
+        run_id=run_id,
+        limits=load_limits(args.config),
+        progress=_progress,
+        review=_review_task,
+    )
 
 
 def _show_chats(store: Store) -> None:
     rows = store.recent_runs()
     if not rows:
-        print("Сохранённых чатов нет.")
+        print("No saved chats.")
         return
     for row in rows:
-        print("{}  {:12}  {}".format(row["run_id"], row["status"], row["phase"]))
+        messages = store.messages(row["run_id"])
+        preview = next(
+            (message.get("content", "").replace("\n", " ") for message in messages
+             if message.get("role") == "user" and message.get("content")),
+            "no messages",
+        )
+        print("{}  {:12}  {}  {}".format(row["run_id"], row["status"], row["phase"], preview[:80]))
+
+
+def _show_history(store: Store, run_id: str) -> None:
+    """Print the persisted conversation before a chat is resumed."""
+    if not store.run(run_id):
+        print("Chat not found. Use /chats.")
+        return
+    for message in store.messages(run_id):
+        role = message.get("role")
+        if role == "system":
+            continue
+        if role == "tool":
+            name = message.get("name", "tool")
+            content = message.get("content", "")
+            try:
+                content = json.dumps(json.loads(content), ensure_ascii=False)
+            except (TypeError, ValueError):
+                pass
+            print("[tool {}] {}".format(name, content[:500]))
+            continue
+        label = {"user": "you", "assistant": "model"}.get(role, role or "message")
+        content = message.get("content") or ""
+        if message.get("tool_calls"):
+            names = ", ".join(call.get("function", {}).get("name", "?") for call in message["tool_calls"])
+            content = (content + " " if content else "") + "calls: " + names
+        print("[{}] {}".format(label, content))
+
+
+def _resolve_unknown_calls(runtime: AgentRuntime, store: Store) -> None:
+    rows = list(
+        store.db.execute(
+            "SELECT call_id, name FROM calls WHERE run_id=? AND status='unknown' ORDER BY rowid",
+            (runtime.run_id,),
+        )
+    )
+    for row in rows:
+        print("\nUnknown call {} ({}).".format(row["call_id"], row["name"]))
+        print("Choose an action: [r]etry, [f]ail, or [a]bort: ", end="", flush=True)
+        action = _read_prompt().lower()
+        actions = {"r": "retry", "retry": "retry", "f": "fail", "fail": "fail", "a": "abort", "abort": "abort"}
+        while action not in actions:
+            print("Enter retry, fail, or abort: ", end="", flush=True)
+            action = _read_prompt().lower()
+        print(runtime.resolve(row["call_id"], actions[action]))
 
 
 def _command(prompt: str, runtime: AgentRuntime, store: Store, client, args):
@@ -64,11 +142,19 @@ def _command(prompt: str, runtime: AgentRuntime, store: Store, client, args):
     try:
         parts = shlex.split(prompt)
     except ValueError as exc:
-        print("Ошибка команды: {}".format(exc))
+        print("Command error: {}".format(exc))
         return True
     command = parts[0].lower()
     if command in {"/help", "/?"}:
-        print("/chats /resume [run_id] /approve /reject /status /budget /tasks /diff /rollback /resolve <id> <retry|fail|abort> /exit")
+        print("/new /chats /resume [run_id] /approve /reject /status /budget /tasks /diff /rollback /resolve <id> <retry|fail|abort> /exit")
+    elif command == "/new":
+        if len(parts) != 1:
+            print("Usage: /new")
+        else:
+            new_runtime = _new_runtime(client, store, args)
+            print("New chat: {}".format(new_runtime.run_id))
+            print("Chat history for {} is empty.".format(new_runtime.run_id))
+            return ("switch", new_runtime)
     elif command == "/chats":
         _show_chats(store)
     elif command == "/resume":
@@ -77,14 +163,16 @@ def _command(prompt: str, runtime: AgentRuntime, store: Store, client, args):
             rows = store.recent_runs(1)
             target = rows[0]["run_id"] if rows else None
         if target is None or store.run(target) is None:
-            print("Чат не найден. Используйте /chats.")
+            print("Chat not found. Use /chats.")
         else:
             new_runtime = _new_runtime(client, store, args, target)
-            print("Текущий чат: {}".format(target))
+            _show_history(store, target)
             try:
-                print(new_runtime.resume())
+                result = new_runtime.resume()
+                print(result)
+                _resolve_unknown_calls(new_runtime, store)
             except RuntimeError as exc:
-                print("Не удалось продолжить: {}".format(exc))
+                print("Could not resume: {}".format(exc))
             return ("switch", new_runtime)
     elif command == "/approve":
         print(runtime.approve())
@@ -92,28 +180,29 @@ def _command(prompt: str, runtime: AgentRuntime, store: Store, client, args):
         print(runtime.reject())
     elif command == "/status":
         row = store.run(runtime.run_id)
-        print(dict(row) if row else "Активного чата нет")
+        print(dict(row) if row else "No active chat")
     elif command == "/budget":
         row = store.budget(runtime.run_id)
-        print(dict(row) if row else "Бюджет появится после старта")
+        print(dict(row) if row else "Budget is available after starting a chat")
     elif command == "/tasks":
         rows = store.tasks(runtime.run_id)
-        print("\n".join("[{}] {} {}".format("x" if r["status"] == "done" else " ", r["task_id"], r["description"]) for r in rows) or "Задач пока нет")
+        marks = {"done": "x", "awaiting_review": "?", "running": ">"}
+        print("\n".join("[{}] {} {}".format(marks.get(r["status"], " "), r["task_id"], r["description"]) for r in rows) or "No tasks yet")
     elif command == "/diff":
         rows = store.db.execute("SELECT path,diff FROM changes WHERE run_id=?", (runtime.run_id,))
-        print("".join(row["diff"] for row in rows) or "Изменений нет")
+        print("".join(row["diff"] for row in rows) or "No changes")
     elif command == "/rollback":
         runtime.rollback()
-        print("Откат выполнен.")
+        print("Rollback completed.")
     elif command == "/resolve":
         if len(parts) != 3 or parts[2] not in {"retry", "fail", "abort"}:
-            print("Использование: /resolve <id> <retry|fail|abort>")
+            print("Usage: /resolve <call_id> <retry|fail|abort>")
         else:
             print(runtime.resolve(parts[1], parts[2]))
     elif command == "/exit":
         return "exit"
     else:
-        print("Неизвестная команда. Используйте /help")
+        print("Unknown command. Use /help")
     return True
 
 
@@ -125,15 +214,17 @@ def _chat(args) -> int:
         rows = store.recent_runs(1) if args.resume == "latest" else []
         run_id = rows[0]["run_id"] if rows else args.resume if store.run(args.resume) else None
         if run_id is None:
-            print("Чат для resume не найден. Начните новый запрос.", file=sys.stderr)
+            print("Chat for resume not found. Start a new request.", file=sys.stderr)
     runtime = _new_runtime(client, store, args, run_id)
-    print("Coding agent. /chats — список чатов, /resume [run_id] — переключение.")
+    print("General purpose agent. /chats — list chats, /resume [run_id] — switch chats.")
     if run_id:
-        print("Продолжаю чат {}".format(run_id))
+        _show_history(store, run_id)
         try:
-            print(runtime.resume())
+            result = runtime.resume()
+            print(result)
+            _resolve_unknown_calls(runtime, store)
         except RuntimeError as exc:
-            print("Восстановление: {}".format(exc))
+            print("Recovery error: {}".format(exc))
     while True:
         try:
             prompt = input("agent> ").strip()
@@ -154,14 +245,16 @@ def _chat(args) -> int:
             if store.run(runtime.run_id) is None:
                 if args.plan:
                     print(runtime.start(prompt, plan=True))
-                    answer = input("Утвердить план? [y/N]: ").strip().lower()
+                    answer = input("Approve plan? [y/N]: ").strip().lower()
                     print(runtime.approve() if answer in {"y", "yes", "да", "д"} else runtime.reject())
                 else:
                     print(runtime.start(prompt))
             else:
                 print(runtime.continue_prompt(prompt))
+        except KeyboardInterrupt:
+            print("\nLoop interrupted. State was saved; use /resume to continue.")
         except (ModelError, RuntimeError, OSError) as exc:
-            print("Ошибка: {}".format(exc))
+            print("Error: {}".format(exc))
     return 0
 
 
@@ -173,10 +266,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         return _chat(_parser().parse_args(raw_argv))
     except CliUsageError as exc:
-        print("Ошибка параметров: {}".format(exc), file=sys.stderr)
+        print("Argument error: {}".format(exc), file=sys.stderr)
         return 2
     except (ModelError, RuntimeError, OSError, ValueError) as exc:
-        print("Ошибка: {}".format(exc), file=sys.stderr)
+        print("Error: {}".format(exc), file=sys.stderr)
         return 1
 
 
