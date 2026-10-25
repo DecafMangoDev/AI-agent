@@ -1,0 +1,6 @@
+# Единый бюджет одного run_id. Счётчики сохраняются в SQLite.
+[limits]
+model = 20
+tools = 40
+effects = 15
+result = 120000
