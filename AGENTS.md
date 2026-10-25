@@ -1,195 +1,56 @@
-# AGENTS.md
+# Repository instructions
 
-## Назначение проекта
+This repository is a teaching project: a general-purpose OpenAI-compatible coding agent with SQLite persistence, Plan Mode, budgets, recovery, task review, change journaling, diff, conflict detection, and rollback.
 
-Это учебный coding agent с tool calling по заданию `HW.md`. Агент получает задачу на изменение небольшого проекта, самостоятельно исследует workspace, выбирает инструменты, меняет файлы, запускает тесты и завершает работу осмысленным текстовым ответом.
+## Engineering rules
 
-Главная инженерная цель — надёжный runtime агента:
+- Use Python 3.9+ and UTF-8 for source, JSON, user messages, and text files.
+- Keep model decisions separate from tool execution. The model never accesses the filesystem, shell, or SQLite directly.
+- Store run history, messages, tool calls, attempts, results, budgets, plans, tasks, snapshots, and changes in SQLite.
+- Keep CLI formatting in `agent/__main__.py`; core runtime must return structured results and must not print.
+- Use small typed functions, domain errors, and narrow exception handling. Avoid broad `except Exception`.
+- Do not use an agent framework. The model adapter may use the official provider SDK, but this project currently uses a dependency-free HTTP adapter.
 
-- решение модели отделено от исполнения инструментов;
-- состояние запуска сохраняется после каждого значимого перехода;
-- сбои, повторные вызовы и неопределённые действия обрабатываются явно;
-- расход запросов, инструментов, побочных действий и результатов ограничивается бюджетом;
-- изменения проекта можно проверить, показать и откатить.
+## Workspace and tools
 
-Контрольный проект находится в `workspace/`. Тесты контрольного проекта нельзя изменять, чтобы исправить задачу.
+The control project lives in `workspace/`. Do not modify its tests to make an agent test pass. Paths resolve relative to the workspace and must not escape it, be absolute, or follow symlinks outside it.
 
-## Целевой уровень
+Every tool has a name, description, JSON Schema, validation, and a registered executor. The minimum tool set is `list_files`, `read_file`, `write_file`, `delete_file`, and restricted `bash`.
 
-Проект целится в 10 баллов и включает все предыдущие уровни:
+Bash runs inside the workspace with a timeout and bounded output. Reject redirects, pipes, command substitution, source-changing commands, and unsafe path arguments. Any allowlist expansion must be explicit and tested.
 
-1. agent loop, tool calling, Bash, чтение и изменение файлов;
-2. восстановление после сбоя;
-3. Plan Mode с явным подтверждением;
-4. единый бюджет запуска;
-5. задачи с зависимостями и проверяемыми результатами;
-6. журнал изменений, diff, обнаружение конфликтов и rollback.
+## State and recovery
 
-## Технологические ограничения
+Each run has a stable `run_id`. Before an external side effect, atomically reserve its budget and record the call as `started`. Save the result and final status afterward. If the process stops between execution and result persistence, the call is `unknown`; `/resume` must ask the user to retry, fail, or abort rather than replaying it silently.
 
-- Python 3.9+.
-- Все пользовательские сообщения, JSON и текстовые файлы обрабатываются в UTF-8.
-- Не использовать готовые агентские фреймворки.
-- Допустим официальный SDK модели только внутри адаптера провайдера.
-- Основной контракт модели — OpenAI-compatible API.
-- Любой OpenAI-compatible провайдер подключается через тот же контракт и переменные окружения; автоматический fallback между моделями не требуется.
-- Runtime и тесты не должны зависеть от наличия сети.
-- Состояние хранить в SQLite; не заменять его глобальными переменными или только JSON-файлами.
-- CLI строить на стандартной библиотеке `argparse`, если нет обоснованной причины для другой зависимости.
+Successful tool call IDs are idempotent. A changed tool name or argument set is a protocol error. A retry is a new attempt of the same call with the same arguments.
 
-## Архитектурные границы
+## Plans and tasks
 
-Рекомендуемые слои:
+Plan Mode allows read-only tools until approval. After approval, steps become dependent tasks. A task is only complete after a successful tool result is shown to the user and accepted. Rejection records the user's comment and returns the task to the model. Completed tasks must not run again after resume.
 
-- `model/` — общий интерфейс `ModelClient`, OpenAI-compatible адаптер и fake model;
-- `runtime/` — цикл сообщений, состояния, бюджеты, восстановление и завершение;
-- `tools/` — схемы, валидация и исполнители инструментов;
-- `storage/` — SQLite-схема и транзакции;
-- `changes/` — снимки, хеши, diff, конфликты и rollback;
-- `cli/` — единый интерактивный chat-вход; approve, resume, resolve, status, tasks, diff и rollback доступны runtime как внутренние операции.
+## Budgets
 
-Модель не должна напрямую читать файловую систему, запускать shell или изменять SQLite. Все действия проходят через runtime и зарегистрированный инструмент.
+Budgets apply to the whole `run_id`, including planning, execution, resume, and retry:
 
-## Инструменты
-
-Минимальный набор:
-
-- `list_files(path)`;
-- `read_file(path)`;
-- `write_file(path, content)`;
-- `bash(command, cwd)`.
-
-Для каждого инструмента обязательны имя, описание и JSON Schema аргументов. Runtime проверяет имя, типы, обязательные поля и допустимые пути до запуска.
-
-Все пути разрешаются относительно workspace. Запрещены выход из workspace через `..`, абсолютные пути и символические ссылки, уводящие наружу.
-
-### Bash policy
-
-Bash запускается с рабочей директорией внутри workspace, таймаутом, ограничением stdout/stderr и управляемым завершением процесса.
-
-По умолчанию разрешаются команды поиска и тестирования: `pwd`, `ls`, `find`, `python3 -m unittest`, `pytest`, `git status`, `git diff` и явно эквивалентные безопасные варианты.
-
-Блокируются shell-операции, которые могут обходить runtime-журнал: перенаправления, пайпы, `rm`, `mv`, `cp`, `sed -i`, `chmod`, запись через интерпретаторы и другие команды изменения исходников. Расширение allowlist должно быть явным, тестируемым и журналируемым.
-
-## Состояние и восстановление
-
-Каждый запуск имеет `run_id`. В SQLite сохраняются история сообщений, tool calls, попытки, результаты, решения пользователя, план, задачи, бюджеты, снимки и изменения файлов.
-
-Перед побочным действием:
-
-1. атомарно проверить и списать бюджет;
-2. сохранить попытку со статусом `started`;
-3. выполнить инструмент;
-4. сохранить результат и финальный статус.
-
-Если процесс остановился между шагами 3 и 4, вызов считается `unknown` и не запускается повторно автоматически. Пользователь явно выбирает `retry`, `fail` или `abort`.
-
-Успешный `tool_call_id` идемпотентен. Повтор с другим именем инструмента или аргументами — protocol error. Явный retry оформляется отдельной попыткой того же вызова.
-
-## Plan Mode и задачи
-
-До подтверждения плана разрешены только операции чтения. План содержит цель, шаги, инструменты, риски, допущения и критерий готовности.
-
-После approve шаги преобразуются в задачи с идентификатором, зависимостями, состоянием и проверяемым результатом. Задача не считается завершённой только на основании текста модели. Завершённые задачи после `resume` не запускаются повторно.
-
-## Бюджеты
-
-Бюджет действует на весь `run_id`, включая планирование, исполнение, resume и retry. Минимальные лимиты:
-
-- запросы к модели;
+- model requests;
 - tool calls;
-- побочные действия;
-- суммарный размер результатов инструментов.
+- potentially changing effects;
+- total tool-result bytes.
 
-Если остатка не хватает на всю пачку tool calls, ни один вызов пачки не запускается. Если размер результата заранее неизвестен, инструмент получает доступный остаток, а runtime явно помечает обрезанный результат.
+For a multi-call response, reserve the complete tool/effect budget before starting any call. If the batch cannot fit, run none of it. Persist all counters in SQLite.
 
-## Журнал изменений и rollback
+## Change journal and rollback
 
-Перед каждым потенциально изменяющим действием сверять текущее дерево с последним снимком. Снимок включает содержимое файлов и список путей, чтобы фиксировать создание и удаление.
+Before every potentially changing action, compare the current workspace with the latest snapshot. Afterward, persist original and final states, hashes, and a diff for every changed path. Rollback operates only on paths changed by the current `run_id`: verify every final hash first, then restore all paths. If any path has an external conflict, write nothing and report the reason.
 
-Для каждого затронутого файла хранить исходное состояние до первого изменения, итоговое состояние после последнего изменения, хеши и фактический diff.
+## Verification and workflow
 
-Rollback:
-
-- восстанавливает только файлы текущего `run_id`;
-- перед записью сверяет хеши;
-- при внешнем конфликте не перезаписывает ни один файл;
-- после `resume` использует тот же журнал.
-
-## Стиль кода
-
-- Использовать `from __future__ import annotations`, если это упрощает совместимость с Python 3.9.
-- Публичные функции, методы и структуры данных типизировать.
-- Предпочитать небольшие функции с одной ответственностью.
-- Ошибки предметной области оформлять собственными исключениями или типизированными результатами.
-- Не скрывать ошибки широким `except Exception`; перехватывать только ожидаемые классы ошибок и сохранять диагностический контекст.
-- Не смешивать вывод CLI, бизнес-логику и доступ к SQLite.
-- Не использовать `print` в ядре runtime; CLI получает структурированный результат и форматирует его.
-- Комментарии объясняют причину решения, а не повторяют код.
-- Имена модулей и функций — `snake_case`, классы — `PascalCase`, константы — `UPPER_SNAKE_CASE`.
-- Документация и пользовательские сообщения — на русском языке, имена API и кода — на английском.
-
-## Линтинг и форматирование
-
-Для статической проверки используется Ruff. Перед коммитом запускать `python3 -m ruff check agent tests`; ошибки Ruff считаются блокирующими. Конфигурация находится в `pyproject.toml`, контрольный проект `workspace/` исключён из линтера.
-
-## Тестирование
-
-Перед изменениями сначала понять существующий контракт. После изменений запускать минимальный релевантный набор, затем полный набор тестов.
-
-Обязательные сценарии:
-
-1. несколько tool calls в одном ответе модели;
-2. ошибка инструмента с продолжением цикла;
-3. исправление `workspace/order.py` через агента;
-4. запуск тестов через Bash;
-5. неизменный `workspace/test_order.py`;
-6. сбой между выполнением инструмента и сохранением результата;
-7. запрет побочных действий до approve;
-8. исчерпание каждого бюджета;
-9. сохранение счётчиков после resume;
-10. минимум три задачи с зависимостью;
-11. просмотр diff и успешный rollback;
-12. конфликт при внешнем изменении файла.
-
-Тесты должны быть детерминированными. Для сценариев runtime использовать fake model, fake clock и управляемую точку отказа. Сетевой endpoint проверять отдельным smoke-тестом и не включать в обязательный CI.
-
-Команды по умолчанию:
+Run the relevant tests first, then the full suite:
 
 ```bash
 python3 -m unittest discover -v
-python3 -m unittest -v
+python3 -m ruff check agent tests
 ```
 
-## Секреты и конфигурация
-
-Секреты брать из переменных окружения или локального `.env`, который не коммитится. Никогда не выводить API-ключи в логи, тестовые отчёты, diff или сообщения модели.
-
-Ожидаемые переменные:
-
-```text
-OPENAI_API_KEY=
-OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_MODEL=
-```
-
-`.env.example` содержит только placeholders. При обнаружении ключа в Git немедленно удалить его из индекса и отозвать ключ у провайдера.
-
-## Git и рабочий процесс
-
-- Перед началом проверить `git status` и не затирать чужие изменения.
-- Делать небольшие тематические коммиты с понятными сообщениями.
-- Не коммитить `.env`, базы запусков, кэш, виртуальные окружения и сгенерированные логи.
-- Не изменять контрольные тесты ради прохождения проверки.
-- Не выполнять destructive-команды без явного требования пользователя.
-
-## Критерии готовности изменения
-
-Изменение готово, когда:
-
-- требования и инварианты не нарушены;
-- релевантные тесты проходят;
-- полный тестовый набор проходит или причина отказа зафиксирована;
-- документация и CLI-примеры соответствуют фактическому поведению;
-- секреты не попали в Git;
-- diff понятен и не содержит лишних файлов или изменений.
+Do not commit `.env`, SQLite databases, caches, virtual environments, or generated logs. Before committing, inspect `git status`, preserve unrelated user changes, and keep commits focused.

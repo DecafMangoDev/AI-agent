@@ -185,6 +185,21 @@ class ReviewRegressionTest(unittest.TestCase):
         self.assertIn("workspace conflict", result["error"])
         self.assertEqual((root / "a.txt").read_text(), "outside")
 
+    def test_external_change_before_first_write_is_detected(self):
+        root, store = self.make()
+        model = FakeModel([AssistantTurn("done", [])])
+        runtime = AgentRuntime(model, store, str(root))
+        runtime.start("x")
+        registry = ToolRegistryForTest(runtime)
+        (root / "a.txt").write_text("outside", encoding="utf-8")
+        result = runtime._execute_call(
+            ToolCall("c", "write_file", {"path": "a.txt", "content": "new"}),
+            registry,
+            False,
+        )
+        self.assertIn("workspace conflict", result["error"])
+        self.assertEqual((root / "a.txt").read_text(), "outside")
+
     def test_fault_point_creates_unknown_and_retry_executes(self):
         from unittest.mock import patch
 

@@ -18,52 +18,6 @@ PLAN_SYSTEM = """You are a coding agent planner. Use read-only tools only. Retur
 DEFAULT_LIMITS = {"model": 20, "tools": 40, "effects": 15, "result": 120000}
 
 
-def _needs_tools(prompt: str) -> bool:
-    """Recognize clear workspace requests before exposing side-effecting tools to the model."""
-    text = prompt.lower()
-    markers = (
-        "код",
-        "файл",
-        "проект",
-        "тест",
-        "репозитор",
-        "workspace",
-        "code",
-        "file",
-        "project",
-        "test",
-        "bug",
-        "error",
-        "implement",
-        "refactor",
-        "fix",
-        "inspect",
-        "show",
-        "create",
-        "modify",
-        "delete",
-        "execute",
-        "directory",
-        "folder",
-        "read",
-        "write",
-        "change",
-        "run",
-        "исправ",
-        "измени",
-        "посмотр",
-        "покаж",
-        "создай",
-        "удали",
-        "добавь",
-        "сделай",
-        "запусти",
-    )
-    return any(marker in text for marker in markers) or any(
-        token in text for token in ("/", ".py", ".txt", ".json", "pytest", "unittest")
-    )
-
-
 class InjectedFault(RuntimeError):
     """Deterministic fault point used by recovery tests."""
 
@@ -86,7 +40,6 @@ class AgentRuntime:
         self.limits = limits or DEFAULT_LIMITS.copy()
         self.progress = progress or (lambda _message: None)
         self.review = review
-        self._tools_enabled = True
 
     def _progress(self, message: str) -> None:
         """Publish a short event for interactive clients without coupling core to stdout."""
@@ -150,7 +103,6 @@ class AgentRuntime:
             self.run_id, "system", {"role": "system", "content": PLAN_SYSTEM if plan else SYSTEM}
         )
         self.store.add_message(self.run_id, "user", {"role": "user", "content": prompt})
-        self._tools_enabled = plan or _needs_tools(prompt)
         return self._planning() if plan else self._safe_loop(False)
 
     def continue_prompt(self, prompt: str) -> str:
@@ -161,7 +113,6 @@ class AgentRuntime:
             raise RuntimeError("cannot continue a {} run".format(row["status"]))
         self.store.update_run(self.run_id, status="active", phase="executing", error=None)
         self.store.add_message(self.run_id, "user", {"role": "user", "content": prompt})
-        self._tools_enabled = _needs_tools(prompt)
         self._progress("[run {}] continuing request".format(self.run_id[:8]))
         return self._safe_loop(False)
 
@@ -272,8 +223,7 @@ class AgentRuntime:
                     self.run_id[:8], self._budget_remaining()
                 )
             )
-            tools = registry.definitions() if (plan_mode or self._tools_enabled) else []
-            turn = self.client.complete(self.store.messages(self.run_id), tools)
+            turn = self.client.complete(self.store.messages(self.run_id), registry.definitions())
             assistant: Dict[str, Any] = {"role": "assistant", "content": turn.content}
             if turn.tool_calls:
                 assistant["tool_calls"] = [
@@ -518,8 +468,13 @@ class AgentRuntime:
         current_tree = _tree(self.workspace)
         for row in rows:
             current = current_tree.get(row["path"])
-            if (None if current is None else _hash(current)) != row["final_hash"]:
-                raise RuntimeError("rollback conflict: " + row["path"])
+            current_hash = None if current is None else _hash(current)
+            if current_hash != row["final_hash"]:
+                raise RuntimeError(
+                    "rollback conflict at {}: expected {}, found {}".format(
+                        row["path"], row["final_hash"] or "<missing>", current_hash or "<missing>"
+                    )
+                )
         for row in rows:
             path = _path(self.workspace, row["path"])
             if path.exists() or path.is_symlink():

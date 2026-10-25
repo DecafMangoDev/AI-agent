@@ -71,6 +71,7 @@ class ToolRegistry:
         self.store = store
         self.run_id = run_id
         self.timeout = timeout
+        self._ensure_baseline_snapshot()
         self.specs = [
             {
                 "type": "function",
@@ -138,6 +139,17 @@ class ToolRegistry:
                 },
             },
         ]
+
+    def _ensure_baseline_snapshot(self) -> None:
+        row = self.store.db.execute(
+            "SELECT 1 FROM snapshots WHERE run_id=? LIMIT 1", (self.run_id,)
+        ).fetchone()
+        if row is not None:
+            return
+        self.store.db.execute(
+            "INSERT INTO snapshots(run_id,seq,tree_json) VALUES(?,?,?)",
+            (self.run_id, 0, json.dumps(_tree(self.workspace), ensure_ascii=False, sort_keys=True)),
+        )
 
     def definitions(self) -> List[Dict[str, Any]]:
         return self.specs

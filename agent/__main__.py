@@ -8,6 +8,11 @@ import shlex
 import sys
 from typing import List, Optional
 
+try:
+    from prompt_toolkit import prompt as terminal_prompt
+except ImportError:  # pragma: no cover - optional fallback for minimal environments
+    terminal_prompt = None
+
 from .client import ModelConfig, ModelError, OpenAICompatibleClient
 from .config import load_limits
 from .runtime import AgentRuntime
@@ -46,8 +51,8 @@ def _progress(message: str) -> None:
     print("\r" + message + "\033[K", file=sys.stderr, flush=True)
 
 
-def _read_prompt() -> str:
-    return input().strip()
+def _read_prompt(message: str = "") -> str:
+    return (terminal_prompt(message) if terminal_prompt is not None else input(message)).strip()
 
 
 def _review_task(task_id: str, payload) -> tuple:
@@ -192,8 +197,12 @@ def _command(prompt: str, runtime: AgentRuntime, store: Store, client, args):
         rows = store.db.execute("SELECT path,diff FROM changes WHERE run_id=?", (runtime.run_id,))
         print("".join(row["diff"] for row in rows) or "No changes")
     elif command == "/rollback":
-        runtime.rollback()
-        print("Rollback completed.")
+        try:
+            runtime.rollback()
+        except RuntimeError as exc:
+            print("Rollback blocked: {}".format(exc))
+        else:
+            print("Rollback completed.")
     elif command == "/resolve":
         if len(parts) != 3 or parts[2] not in {"retry", "fail", "abort"}:
             print("Usage: /resolve <call_id> <retry|fail|abort>")
@@ -227,7 +236,7 @@ def _chat(args) -> int:
             print("Recovery error: {}".format(exc))
     while True:
         try:
-            prompt = input("agent> ").strip()
+            prompt = _read_prompt("agent> ")
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -245,7 +254,7 @@ def _chat(args) -> int:
             if store.run(runtime.run_id) is None:
                 if args.plan:
                     print(runtime.start(prompt, plan=True))
-                    answer = input("Approve plan? [y/N]: ").strip().lower()
+                    answer = _read_prompt("Approve plan? [y/N]: ").lower()
                     print(runtime.approve() if answer in {"y", "yes", "да", "д"} else runtime.reject())
                 else:
                     print(runtime.start(prompt))
