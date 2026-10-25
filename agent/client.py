@@ -52,9 +52,9 @@ class ModelConfig:
         _load_dotenv_if_present(values)
         api_key = values.get("OPENAI_API_KEY", "").strip()
         base_url = (
-            base_url_override or values.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+            base_url_override or values.get("OPENAI_BASE_URL", "http://localhost:11434/v1/")
         ).strip()
-        model = (model_override or values.get("OPENAI_MODEL", "")).strip()
+        model = (model_override or values.get("OPENAI_MODEL", "qwen3:4b")).strip()
         if not api_key:
             raise ModelError("OPENAI_API_KEY не задан")
         if not model:

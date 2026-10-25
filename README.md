@@ -8,7 +8,10 @@
 python3 -m agent --workspace workspace
 ```
 
-Настройте `.env` по примеру `.env.example`. Лимиты лежат в `agent.toml` и действуют на весь `run_id`, включая plan, approve, resume и retry.
+По умолчанию используется локальная Ollama-модель `qwen3:4b` через `http://localhost:11434/v1/`.
+Запустите её командами `ollama pull qwen3:4b` и `ollama serve`, затем настройте `.env` по примеру `.env.example`.
+Для другого OpenAI-compatible провайдера замените `OPENAI_BASE_URL` и `OPENAI_MODEL`.
+Лимиты лежат в `agent.toml` и действуют на весь `run_id`, включая plan, approve, resume и retry.
 
 ```toml
 [limits]
