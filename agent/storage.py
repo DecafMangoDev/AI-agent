@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -35,6 +36,21 @@ class Store:
         for name in ("last_call_id", "completed_call_id", "review_comment"):
             if name not in task_columns:
                 self.db.execute("ALTER TABLE tasks ADD COLUMN {} TEXT".format(name))
+
+    @contextmanager
+    def transaction(self):
+        """Serialize a complete state transition, including budget checks."""
+        if self.db.in_transaction:
+            yield
+            return
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self.db.rollback()
+            raise
+        else:
+            self.db.commit()
 
     def close(self) -> None:
         self.db.close()
@@ -124,7 +140,7 @@ class Store:
     def reserve(self, run_id: str, kind: str, amount: int = 1) -> None:
         columns = {"model": "model", "tools": "tool", "effects": "effect", "result": "result"}
         prefix = columns[kind]
-        with self.db:
+        with self.transaction():
             row = self.budget(run_id)
             used = row[prefix + "_used"]
             limit = row[prefix + "_limit"]
@@ -139,7 +155,7 @@ class Store:
         self, run_id: str, amounts: Dict[str, int], starts: Optional[List[tuple]] = None
     ) -> None:
         columns = {"model": "model", "tools": "tool", "effects": "effect", "result": "result"}
-        with self.db:
+        with self.transaction():
             row = self.budget(run_id)
             for kind, amount in amounts.items():
                 prefix = columns[kind]
@@ -218,7 +234,7 @@ class Store:
 
     def tasks(self, run_id: str) -> List[sqlite3.Row]:
         return list(
-            self.db.execute("SELECT * FROM tasks WHERE run_id=? ORDER BY task_id", (run_id,))
+            self.db.execute("SELECT * FROM tasks WHERE run_id=? ORDER BY rowid", (run_id,))
         )
 
     def task_status(self, run_id: str, task_id: str, status: str, evidence: Any = None) -> None:

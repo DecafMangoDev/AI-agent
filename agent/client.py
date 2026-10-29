@@ -79,15 +79,28 @@ class OpenAICompatibleClient:
         payload: Dict[str, Any] = {"model": self.config.model, "messages": messages}
         if tools:
             payload["tools"] = tools
+            luna = self.config.model == "gpt-6-luna" or self.config.model.startswith("gpt-6-luna-")
+            if luna:
+                if self.config.reasoning_effort != "none":
+                    raise ModelError(
+                        "gpt-6-luna с инструментами в Chat Completions требует "
+                        "OPENAI_REASONING_EFFORT=none. Для reasoning с инструментами "
+                        "нужен Responses API, который этот адаптер пока не реализует."
+                    )
+                # Omitting this field selects the model's default, not 'none'.
+                payload["reasoning_effort"] = "none"
             # Ollama supports tools but not OpenAI's tool_choice/reasoning_effort fields.
             if (
                 "localhost:11434" not in self.config.base_url
                 and "127.0.0.1:11434" not in self.config.base_url
             ):
-                payload["reasoning_effort"] = self.config.reasoning_effort
+                if self.config.reasoning_effort != "none":
+                    payload["reasoning_effort"] = self.config.reasoning_effort
         raw = self._post(payload)
         try:
             message = raw["choices"][0]["message"]
+            if not isinstance(message, dict):
+                raise ValueError("message must be an object")
             content = message.get("content") or ""
             calls = []
             for item in message.get("tool_calls") or []:

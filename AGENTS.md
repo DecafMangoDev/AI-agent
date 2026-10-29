@@ -19,6 +19,11 @@ Every tool has a name, description, JSON Schema, validation, and a registered ex
 
 Bash runs inside the workspace with a timeout and bounded output. Reject redirects, pipes, command substitution, source-changing commands, and unsafe path arguments. Any allowlist expansion must be explicit and tested.
 
+Diagnostic allowlist: `python`/`python3` accept exactly `--version` or `-V`;
+`ls` also accepts `-a`, `-l`, `-la`, `-al`, `-h`, `-lah`, and `-alh`.
+Keep these forms covered by `tests/test_bash_allowlist.py`, including rejection
+before process creation of compound commands, extra version arguments and escaping paths.
+
 ## State and recovery
 
 Each run has a stable `run_id`. Before an external side effect, atomically reserve its budget and record the call as `started`. Save the result and final status afterward. If the process stops between execution and result persistence, the call is `unknown`; `/resume` must ask the user to retry, fail, or abort rather than replaying it silently.
@@ -54,3 +59,25 @@ python3 -m ruff check agent tests
 ```
 
 Do not commit `.env`, SQLite databases, caches, virtual environments, or generated logs. Before committing, inspect `git status`, preserve unrelated user changes, and keep commits focused.
+
+## Reliability implementation notes
+
+- Budget reservations must use `Store.transaction()` (`BEGIN IMMEDIATE`), never rely on a connection context manager in autocommit mode.
+- Finish the same attempt that was recorded as started. Create another attempt only for an explicit retry; inspect latest attempts during recovery.
+- A run is bound to its canonical workspace. Reject mismatches before executing or rolling back.
+- Preserve exact file bytes in snapshots. A decoded text diff is a presentation, not restoration data. Refuse legacy binary snapshots that contain only hashes.
+- Check result capacity before execution; a zero result budget must never permit a side effect.
+- Treat rollback as a recorded terminal operation. Reject unresolved attempts and type conflicts before the first restore.
+- Add regression tests in `tests/test_reliability.py`; keep fixtures in temporary directories and service state outside those workspaces.
+- `REVIEW.md` is a historical audit. Track remaining limitations honestly in README; do not imply that all findings have been resolved merely because the existing tests pass.
+
+## Phase and execution regressions
+
+- Construct model system instructions from the current phase on every request; never carry planner-only restrictions into execution.
+- Do not execute tool-shaped JSON/XML from assistant text. Return a corrective message and bound retries.
+- Validate Python syntax before writes; never globally replace literal backslash escapes in source.
+- Require successful test execution after Python changes. A filesystem write is not verification.
+- Follow-up work must have new tasks; accepted tasks remain done. Headless operation must wait for explicit review.
+- Recovery must reconstruct missing messages and require explicit attribution of observed changes. Bash is not automatically retryable.
+
+Prefer `run_tests` for test requests. It invokes `python3 -m pytest` or `python3 -m unittest` directly; distinguish runner execution success from a nonzero test exit code. Keep test paths workspace-relative and validate them before execution.

@@ -7,6 +7,12 @@ from agent.runtime import AgentRuntime
 from agent.storage import Store
 
 
+def valid_plan(value):
+    result = {"goal": "inspect", "ready_when": "inspection completed", "risks": [], "assumptions": [], **value}
+    result["steps"] = [{"description": "inspect", "tools": ["read_file"], **step} for step in value["steps"]]
+    return result
+
+
 class FakeModel:
     def __init__(self, turns):
         self.turns = list(turns)
@@ -49,7 +55,7 @@ class RuntimeTest(unittest.TestCase):
                 AssistantTurn(
                     "", [ToolCall("c1", "write_file", {"path": "a.txt", "content": "new"})]
                 ),
-                AssistantTurn("not json", []),
+                AssistantTurn(__import__("json").dumps(valid_plan({"steps": [{"id": "read"}]})), []),
             ]
         )
         text = AgentRuntime(model, store, str(root)).start("change", plan=True)
@@ -238,7 +244,7 @@ class ReviewRegressionTest(unittest.TestCase):
         model = FakeModel(
             [
                 AssistantTurn(
-                    '{"goal":"x","steps":[{"id":"one","description":"read","depends_on":[]}]}', []
+                    __import__("json").dumps(valid_plan({"steps": [{"id": "one", "description": "read", "depends_on": []}]})), []
                 )
             ]
         )
@@ -298,8 +304,8 @@ class PlanRetryTest(unittest.TestCase):
         valid = {"goal": "x", "steps": [{"id": "one", "description": "read", "depends_on": []}]}
         model = FakeModel(
             [
-                AssistantTurn(__import__("json").dumps(invalid), []),
-                AssistantTurn(__import__("json").dumps(valid), []),
+                AssistantTurn(__import__("json").dumps(valid_plan(invalid)), []),
+                AssistantTurn(__import__("json").dumps(valid_plan(valid)), []),
             ]
         )
         runtime = AgentRuntime(model, store, str(root))
@@ -322,13 +328,13 @@ class TaskExecutionTest(unittest.TestCase):
         }
         model = FakeModel(
             [
-                AssistantTurn(json.dumps(plan), []),
-                AssistantTurn(json.dumps(plan), []),
+                AssistantTurn(json.dumps(valid_plan(plan)), []),
+                AssistantTurn(json.dumps(valid_plan(plan)), []),
                 AssistantTurn("", [ToolCall("list", "list_files", {})]),
                 AssistantTurn("готово", []),
             ]
         )
-        runtime = AgentRuntime(model, store, str(root))
+        runtime = AgentRuntime(model, store, str(root), review=lambda *_: (True, ""))
         runtime.start("plan", plan=True)
         self.assertEqual(runtime.approve(), "готово")
         self.assertEqual(store.tasks(runtime.run_id)[0]["status"], "done")
@@ -342,7 +348,7 @@ class TaskExecutionTest(unittest.TestCase):
         plan = {"goal": "inspect", "steps": [{"id": "step_1", "description": "read", "depends_on": []}]}
         model = FakeModel(
             [
-                AssistantTurn(json.dumps(plan), []),
+                AssistantTurn(json.dumps(valid_plan(plan)), []),
                 AssistantTurn("", [ToolCall("first", "read_file", {"path": "a.txt"})]),
                 AssistantTurn("готово", []),
                 AssistantTurn("", [ToolCall("second", "read_file", {"path": "a.txt"})]),

@@ -56,7 +56,7 @@ def _read_prompt(message: str = "") -> str:
 
 
 def _review_task(task_id: str, payload) -> tuple:
-    print("\nTask {} completed technically.".format(task_id))
+    print("\nTask {} result: {}".format(task_id, payload.get("description", "")))
     tool = payload.get("tool", "unknown")
     arguments = json.dumps(payload.get("arguments", {}), ensure_ascii=False, sort_keys=True)
     result = json.dumps(payload.get("result", {}), ensure_ascii=False)
@@ -138,7 +138,19 @@ def _resolve_unknown_calls(runtime: AgentRuntime, store: Store) -> None:
         while action not in actions:
             print("Enter retry, fail, or abort: ", end="", flush=True)
             action = _read_prompt().lower()
-        print(runtime.resolve(row["call_id"], actions[action]))
+        accept_changes = False
+        try:
+            print(runtime.resolve(row["call_id"], actions[action]))
+        except RuntimeError as exc:
+            if "explicit attribution" not in str(exc):
+                raise
+            print(str(exc))
+            accept_changes = _read_prompt("Attribute these changes to this run? [y/N]: ").lower() in {"y", "yes", "да"}
+            if not accept_changes:
+                return
+            print(runtime.resolve(row["call_id"], actions[action], accept_changes=True))
+        if actions[action] == "abort":
+            return
 
 
 def _command(prompt: str, runtime: AgentRuntime, store: Store, client, args):
@@ -242,7 +254,11 @@ def _chat(args) -> int:
             break
         if not prompt:
             continue
-        result = _command(prompt, runtime, store, client, args)
+        try:
+            result = _command(prompt, runtime, store, client, args)
+        except (RuntimeError, OSError, ValueError) as exc:
+            print("Command error: {}".format(exc))
+            continue
         if result == "exit":
             break
         if isinstance(result, tuple) and result[0] == "switch":

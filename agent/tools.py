@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import ast
+import base64
 import difflib
 import hashlib
 import json
+import os
 import selectors
 import shlex
+import signal
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List
@@ -23,6 +27,8 @@ def _root(workspace: str) -> Path:
 
 
 def _path(workspace: str, value: str) -> Path:
+    if Path(value).is_absolute():
+        raise ToolError("absolute paths are forbidden")
     root = _root(workspace)
     candidate = (root / value).resolve()
     if candidate != root and root not in candidate.parents:
@@ -30,7 +36,7 @@ def _path(workspace: str, value: str) -> Path:
     return candidate
 
 
-def _tree(workspace: str) -> Dict[str, str]:
+def _tree(workspace: str, state_path=None) -> Dict[str, str]:
     root = _root(workspace)
     result: Dict[str, str] = {}
     for path in sorted(root.rglob("*")):
@@ -41,17 +47,24 @@ def _tree(workspace: str) -> Dict[str, str]:
         if (
             not path.is_file()
             or ".git" in path.parts
-            or ".agent" in path.parts
-            or path.suffix in {".sqlite3", ".db"}
-            or path.name.endswith(("-wal", "-shm"))
+            or (state_path is not None and str(path.resolve()) in {str(Path(state_path).resolve()) + suffix for suffix in ("", "-wal", "-shm")})
         ):
             continue
         relative = str(path.relative_to(root))
-        try:
-            result[relative] = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            result[relative] = "<binary:" + _hash_bytes(path.read_bytes()) + ">"
+        result[relative] = "@file-v2:" + base64.b64encode(path.read_bytes()).decode("ascii")
     return result
+
+
+def _decode_file(value: str) -> bytes:
+    if value.startswith("@file-v2:"):
+        return base64.b64decode(value[len("@file-v2:"):], validate=True)
+    if value.startswith("<binary:"):
+        raise ToolError("legacy binary snapshot cannot be restored")
+    return value.encode("utf-8")
+
+
+def _diff_lines(value: str) -> List[str]:
+    return _decode_file(value).decode("utf-8", errors="replace").splitlines(True)
 
 
 def _hash(text: str) -> str:
@@ -128,8 +141,38 @@ class ToolRegistry:
             {
                 "type": "function",
                 "function": {
+                    "name": "run_tests",
+                    "description": (
+                        "Run tests without constructing a shell command. Prefer this tool when "
+                        "the user asks to run or diagnose tests. Uses python3 and either pytest "
+                        "or unittest. A nonzero exit code means tests ran and failed; inspect "
+                        "the output. pytest must be installed for that runner."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "runner": {"type": "string", "enum": ["pytest", "unittest"]},
+                            "path": {"type": "string"},
+                            "cwd": {"type": "string"},
+                        },
+                        "required": ["runner"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "bash",
-                    "description": "Run an allowlisted read/test command in workspace",
+                    "description": (
+                        "Run one allowlisted command in workspace. Prefer python3: "
+                        "python may not be installed. Supported diagnostics: python3 --version "
+                        "or -V (also python), pwd, ls (-a, -l, -la, -al, -h, -lah, -alh). "
+                        "Run tests with python3 -m unittest -v or python3 -m pytest -v. "
+                        "unittest has no --version option; use the Python version. "
+                        "Do not combine commands: &&, pipes, redirects and substitutions are "
+                        "forbidden. Use separate tool calls. Paths must stay within workspace."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {"command": {"type": "string"}, "cwd": {"type": "string"}},
@@ -148,7 +191,7 @@ class ToolRegistry:
             return
         self.store.db.execute(
             "INSERT INTO snapshots(run_id,seq,tree_json) VALUES(?,?,?)",
-            (self.run_id, 0, json.dumps(_tree(self.workspace), ensure_ascii=False, sort_keys=True)),
+            (self.run_id, 0, json.dumps(_tree(self.workspace, self.store.path), ensure_ascii=False, sort_keys=True)),
         )
 
     def definitions(self) -> List[Dict[str, Any]]:
@@ -174,7 +217,7 @@ class ToolRegistry:
 
     def execute(self, name: str, args: Dict[str, Any], plan_mode: bool = False) -> Dict[str, Any]:
         self.validate(name, args)
-        if plan_mode and name in {"write_file", "delete_file", "bash"}:
+        if plan_mode and name in {"write_file", "delete_file", "bash", "run_tests"}:
             raise ToolError("side effects are forbidden before plan approval")
         if name == "list_files":
             path = _path(self.workspace, args.get("path", ""))
@@ -187,7 +230,8 @@ class ToolRegistry:
             }
         if name == "read_file":
             path = _path(self.workspace, args["path"])
-            content = path.read_bytes()
+            with path.open("rb") as stream:
+                content = stream.read(self.MAX_READ_BYTES + 1)
             if len(content) > self.MAX_READ_BYTES:
                 return {
                     "path": args["path"],
@@ -199,7 +243,46 @@ class ToolRegistry:
             return self._write(args["path"], args["content"])
         if name == "delete_file":
             return self._delete(args["path"])
+        if name == "run_tests":
+            return self._run_tests(args["runner"], args.get("path", ""), args.get("cwd", ""))
         return self._bash(args["command"], args.get("cwd", ""))
+
+    def _run_tests(self, runner: str, path: str, cwd: str) -> Dict[str, Any]:
+        if runner not in {"pytest", "unittest"}:
+            raise ToolError("runner must be pytest or unittest")
+        workdir = _path(self.workspace, cwd or ".")
+        if path and not (runner == "unittest" and path == "discover"):
+            target = _path(self.workspace, str(Path(cwd or ".") / path))
+            if not target.exists():
+                raise ToolError("test target does not exist: " + path)
+        command = ["python3", "-m", runner]
+        if runner == "unittest":
+            command.append("-v")
+        if path and not (runner == "unittest" and path == "discover"):
+            command.append(path)
+        self._assert_baseline()
+        before = _tree(self.workspace, self.store.path)
+        try:
+            process = subprocess.Popen(
+                command, shell=False, cwd=str(workdir), stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=False, start_new_session=True,
+            )
+        except OSError as exc:
+            raise ToolError("could not start python3 test runner: " + str(exc)) from exc
+        stdout, stderr, timed_out = self._collect(process)
+        after = _tree(self.workspace, self.store.path)
+        if after != before:
+            self._record_changes(before, after)
+        return {
+            "runner": runner,
+            "target": path or ".",
+            "stdout": stdout,
+            "stderr": stderr,
+            "exit_code": process.returncode,
+            "timed_out": timed_out,
+            "truncated": len(stdout.encode("utf-8")) >= self.MAX_OUTPUT_BYTES
+            or len(stderr.encode("utf-8")) >= self.MAX_OUTPUT_BYTES,
+        }
 
     def _assert_baseline(self) -> None:
         rows = self.store.db.execute(
@@ -208,16 +291,21 @@ class ToolRegistry:
         ).fetchone()
         if rows is None:
             return
-        if json.loads(rows["tree_json"]) != _tree(self.workspace):
+        if json.loads(rows["tree_json"]) != _tree(self.workspace, self.store.path):
             raise ToolError("workspace conflict detected before side effect")
 
     def _write(self, path: str, content: str) -> Dict[str, Any]:
         self._assert_baseline()
         target = _path(self.workspace, path)
-        before = _tree(self.workspace)
+        if target.suffix == ".py":
+            try:
+                ast.parse(content, filename=path)
+            except SyntaxError as exc:
+                raise ToolError("invalid Python source; use real newlines, preserve literal escapes in strings: " + str(exc)) from exc
+        before = _tree(self.workspace, self.store.path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
-        self._record_changes(before, _tree(self.workspace))
+        self._record_changes(before, _tree(self.workspace, self.store.path))
         return {"path": path, "bytes": len(content.encode("utf-8"))}
 
     def _delete(self, path: str) -> Dict[str, Any]:
@@ -225,9 +313,9 @@ class ToolRegistry:
         target = _path(self.workspace, path)
         if not target.exists() or not target.is_file() or target.is_symlink():
             raise ToolError("delete_file accepts an existing regular file")
-        before = _tree(self.workspace)
+        before = _tree(self.workspace, self.store.path)
         target.unlink()
-        self._record_changes(before, _tree(self.workspace))
+        self._record_changes(before, _tree(self.workspace, self.store.path))
         return {"path": path, "deleted": True}
 
     def _bash(self, command: str, cwd: str) -> Dict[str, Any]:
@@ -239,12 +327,19 @@ class ToolRegistry:
             raise ToolError("invalid shell syntax") from exc
         if not parts:
             raise ToolError("empty bash command")
+        execution_root = _path(self.workspace, cwd or ".")
+        for value in parts[1:]:
+            if not value.startswith("-"):
+                candidate = (execution_root / value).resolve()
+                if candidate != _root(self.workspace) and _root(self.workspace) not in candidate.parents:
+                    raise ToolError("bash argument escapes workspace")
         if not self._allowed_argv(parts):
             raise ToolError("bash command rejected by allowlist")
         self._assert_baseline()
-        before = _tree(self.workspace)
+        before = _tree(self.workspace, self.store.path)
         process = subprocess.Popen(
-            parts,
+            ["/bin/bash", "--noprofile", "--norc", "-c", "exec " + shlex.join(parts)],
+            start_new_session=True,
             shell=False,
             cwd=str(_path(self.workspace, cwd or ".")),
             stdout=subprocess.PIPE,
@@ -252,22 +347,42 @@ class ToolRegistry:
             text=False,
         )
         stdout, stderr, timed_out = self._collect(process)
-        self._record_changes(before, _tree(self.workspace))
+        self._record_changes(before, _tree(self.workspace, self.store.path))
         return {
             "stdout": stdout,
             "stderr": stderr,
             "exit_code": process.returncode,
             "timed_out": timed_out,
+            "truncated": len(stdout.encode("utf-8")) >= self.MAX_OUTPUT_BYTES or len(stderr.encode("utf-8")) >= self.MAX_OUTPUT_BYTES,
         }
 
     def _allowed_argv(self, parts: List[str]) -> bool:
+        if not parts:
+            return False
         for item in parts[1:]:
             if item.startswith("/") or item == ".." or item.startswith("../") or "/../" in item:
                 return False
-        if parts[0] in {"pwd", "ls", "find"}:
+            if "=" in item:
+                return False
+            if not item.startswith("-"):
+                try:
+                    _path(self.workspace, item)
+                except ToolError:
+                    return False
+        if parts[0] == "ls":
+            return all(
+                not item.startswith("-") or item in {
+                    "-v", "-t", "-a", "-l", "-la", "-al", "-h", "-lah", "-alh"
+                }
+                for item in parts[1:]
+            )
+        if parts[0] in {"pwd", "find"}:
             return all(not item.startswith("-") or item in {"-v", "-t"} for item in parts[1:])
         if parts[0] in {"python", "python3"}:
-            return len(parts) >= 3 and parts[1:3] in [["-m", "unittest"], ["-m", "pytest"]]
+            if parts[1:] in [["--version"], ["-V"]]:
+                return True
+            return (len(parts) >= 3 and parts[1:3] in [["-m", "unittest"], ["-m", "pytest"]]
+                    and all(not x.startswith("-") or x in {"-v", "-q", "-s", "-p", "-t"} for x in parts[3:]))
         if parts[0] == "pytest":
             return all(not item.startswith("-") or item in {"-v", "-q"} for item in parts[1:])
         if parts[0] == "git":
@@ -288,23 +403,27 @@ class ToolRegistry:
         buffers = {"stdout": bytearray(), "stderr": bytearray()}
         timed_out = False
         deadline = __import__("time").monotonic() + self.timeout
-        while selector.get_map():
-            remaining = deadline - __import__("time").monotonic()
-            if remaining <= 0:
-                timed_out = True
-                process.kill()
-                remaining = 0.2
-            for key, _ in selector.select(max(0.05, remaining)):
-                chunk = key.fileobj.read(4096)
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                buffers[key.data].extend(
-                    chunk[: max(0, self.MAX_OUTPUT_BYTES - len(buffers[key.data]))]
-                )
-            if process.poll() is not None and not selector.get_map():
-                break
-        process.wait()
+        try:
+            while selector.get_map() or process.poll() is None:
+                remaining = deadline - __import__("time").monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    break
+                for key, _ in selector.select(min(0.1, remaining)):
+                    chunk = os.read(key.fileobj.fileno(), 4096)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    buffers[key.data].extend(chunk[:max(0, self.MAX_OUTPUT_BYTES - len(buffers[key.data]))])
+            process.wait(timeout=1)
+        finally:
+            selector.close()
+            process.stdout.close()
+            process.stderr.close()
         return (
             buffers["stdout"].decode("utf-8", errors="replace"),
             buffers["stderr"].decode("utf-8", errors="replace"),
@@ -312,35 +431,38 @@ class ToolRegistry:
         )
 
     def _record_changes(self, before: Dict[str, str], after: Dict[str, str]) -> None:
-        seq = self.store.db.execute(
-            "SELECT COALESCE(MAX(seq), 0) + 1 FROM snapshots WHERE run_id=?", (self.run_id,)
-        ).fetchone()[0]
-        self.store.db.execute(
-            "INSERT INTO snapshots(run_id,seq,tree_json) VALUES(?,?,?)",
-            (self.run_id, seq, json.dumps(after, ensure_ascii=False, sort_keys=True)),
-        )
-        for path in set(before) | set(after):
-            if before.get(path) == after.get(path):
-                continue
-            old, new = before.get(path), after.get(path)
-            diff = "".join(
-                difflib.unified_diff(
-                    (old or "").splitlines(True),
-                    (new or "").splitlines(True),
-                    fromfile=path,
-                    tofile=path,
-                )
-            )
+        with self.store.transaction():
+            seq = self.store.db.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM snapshots WHERE run_id=?", (self.run_id,)
+            ).fetchone()[0]
             self.store.db.execute(
-                """INSERT INTO changes(run_id,path,original,final,original_hash,final_hash,diff)
-                VALUES(?,?,?,?,?,?,?) ON CONFLICT(run_id,path) DO UPDATE SET final=excluded.final, final_hash=excluded.final_hash, diff=excluded.diff""",
-                (
-                    self.run_id,
-                    path,
-                    old,
-                    new,
-                    None if old is None else _hash(old),
-                    None if new is None else _hash(new),
-                    diff,
-                ),
+                "INSERT INTO snapshots(run_id,seq,tree_json) VALUES(?,?,?)",
+                (self.run_id, seq, json.dumps(after, ensure_ascii=False, sort_keys=True)),
             )
+            for path in set(before) | set(after):
+                if before.get(path) == after.get(path):
+                    continue
+                old, new = before.get(path), after.get(path)
+                existing = self.store.db.execute("SELECT original FROM changes WHERE run_id=? AND path=?", (self.run_id, path)).fetchone()
+                original = existing["original"] if existing else old
+                diff = "".join(
+                    difflib.unified_diff(
+                        _diff_lines(original or ""),
+                        _diff_lines(new or ""),
+                        fromfile=path,
+                        tofile=path,
+                    )
+                )
+                self.store.db.execute(
+                    """INSERT INTO changes(run_id,path,original,final,original_hash,final_hash,diff)
+                    VALUES(?,?,?,?,?,?,?) ON CONFLICT(run_id,path) DO UPDATE SET final=excluded.final, final_hash=excluded.final_hash, diff=excluded.diff""",
+                    (
+                        self.run_id,
+                        path,
+                        old,
+                        new,
+                        None if old is None else _hash(old),
+                        None if new is None else _hash(new),
+                        diff,
+                    ),
+                )

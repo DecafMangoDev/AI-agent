@@ -20,6 +20,30 @@ class FakeResponse:
 
 
 class ClientTest(unittest.TestCase):
+    def test_luna_tools_explicitly_disable_reasoning(self):
+        tool = {"type": "function", "function": {"name": "list_files", "parameters": {"type": "object", "properties": {}}}}
+        for model in ("gpt-6-luna", "gpt-6-luna-2026-10-01"):
+            with self.subTest(model=model):
+                config = ModelConfig("test-key", "https://example.test/v1", model)
+                with patch("agent.client.request.urlopen", return_value=FakeResponse()) as send:
+                    OpenAICompatibleClient(config).complete([], [tool])
+                payload = json.loads(send.call_args.args[0].data)
+                self.assertEqual(payload["reasoning_effort"], "none")
+                self.assertEqual(payload["tools"], [tool])
+
+    def test_luna_incompatible_reasoning_fails_before_http(self):
+        config = ModelConfig("test-key", "https://example.test/v1", "gpt-6-luna", reasoning_effort="medium")
+        with patch("agent.client.request.urlopen") as send:
+            with self.assertRaisesRegex(ModelError, "OPENAI_REASONING_EFFORT=none"):
+                OpenAICompatibleClient(config).complete([], [{"type": "function"}])
+            send.assert_not_called()
+
+    def test_generic_provider_does_not_receive_default_reasoning(self):
+        config = ModelConfig("test-key", "https://example.test/v1", "test-model")
+        with patch("agent.client.request.urlopen", return_value=FakeResponse()) as send:
+            OpenAICompatibleClient(config).complete([], [{"type": "function"}])
+        self.assertNotIn("reasoning_effort", json.loads(send.call_args.args[0].data))
+
     def test_complete_parses_chat_completion(self):
         config = ModelConfig("test-key", "https://example.test/v1", "test-model")
         with patch("agent.client.request.urlopen", return_value=FakeResponse()) as urlopen:
