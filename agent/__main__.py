@@ -14,7 +14,7 @@ except ImportError:  # pragma: no cover - optional fallback for minimal environm
     terminal_prompt = None
 
 from .client import ModelConfig, ModelError, OpenAICompatibleClient
-from .config import load_limits
+from .config import load_limits, load_permission_rules, load_permissions
 from .runtime import AgentRuntime
 from .storage import Store
 
@@ -70,6 +70,11 @@ def _review_task(task_id: str, payload) -> tuple:
     return False, _read_prompt()
 
 
+def _ask_tool_permission(name: str, arguments: dict) -> bool:
+    print("\nTool permission: {}({})".format(name, json.dumps(arguments, ensure_ascii=False)))
+    return _read_prompt("Allow this call? [y/N]: ").lower() in {"y", "yes", "да", "д"}
+
+
 def _new_runtime(client, store: Store, args, run_id: Optional[str] = None) -> AgentRuntime:
     return AgentRuntime(
         client,
@@ -79,6 +84,9 @@ def _new_runtime(client, store: Store, args, run_id: Optional[str] = None) -> Ag
         limits=load_limits(args.config),
         progress=_progress,
         review=_review_task,
+        permissions=load_permissions(args.config),
+        permission_prompt=_ask_tool_permission,
+        permission_rules=load_permission_rules(args.config),
     )
 
 

@@ -15,6 +15,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List
 
+from .permissions import command_tokens
 from .storage import Store
 
 
@@ -165,13 +166,12 @@ class ToolRegistry:
                 "function": {
                     "name": "bash",
                     "description": (
-                        "Run one allowlisted command in workspace. Prefer python3: "
-                        "python may not be installed. Supported diagnostics: python3 --version "
-                        "or -V (also python), pwd, ls (-a, -l, -la, -al, -h, -lah, -alh). "
-                        "Run tests with python3 -m unittest -v or python3 -m pytest -v. "
-                        "unittest has no --version option; use the Python version. "
-                        "Do not combine commands: &&, pipes, redirects and substitutions are "
-                        "forbidden. Use separate tool calls. Paths must stay within workspace."
+                        "Run one command in workspace, subject to configured ask/allow/deny "
+                        "permissions. There is no built-in command-name allowlist. "
+                        "Prefer python3 because python may not be installed. "
+                        "For tests, prefer run_tests. Do not combine commands: &&, pipes, "
+                        "redirects and substitutions are forbidden. Use separate tool calls. "
+                        "Working directory and path arguments must stay within workspace."
                     ),
                     "parameters": {
                         "type": "object",
@@ -319,22 +319,16 @@ class ToolRegistry:
         return {"path": path, "deleted": True}
 
     def _bash(self, command: str, cwd: str) -> Dict[str, Any]:
-        if any(char in command for char in "\r\n|;&><`$"):
-            raise ToolError("bash command rejected by allowlist")
         try:
-            parts = shlex.split(command)
+            parts = command_tokens(command)
         except ValueError as exc:
-            raise ToolError("invalid shell syntax") from exc
-        if not parts:
-            raise ToolError("empty bash command")
+            raise ToolError("invalid bash command: " + str(exc)) from exc
         execution_root = _path(self.workspace, cwd or ".")
         for value in parts[1:]:
             if not value.startswith("-"):
                 candidate = (execution_root / value).resolve()
                 if candidate != _root(self.workspace) and _root(self.workspace) not in candidate.parents:
                     raise ToolError("bash argument escapes workspace")
-        if not self._allowed_argv(parts):
-            raise ToolError("bash command rejected by allowlist")
         self._assert_baseline()
         before = _tree(self.workspace, self.store.path)
         process = subprocess.Popen(
@@ -355,46 +349,6 @@ class ToolRegistry:
             "timed_out": timed_out,
             "truncated": len(stdout.encode("utf-8")) >= self.MAX_OUTPUT_BYTES or len(stderr.encode("utf-8")) >= self.MAX_OUTPUT_BYTES,
         }
-
-    def _allowed_argv(self, parts: List[str]) -> bool:
-        if not parts:
-            return False
-        for item in parts[1:]:
-            if item.startswith("/") or item == ".." or item.startswith("../") or "/../" in item:
-                return False
-            if "=" in item:
-                return False
-            if not item.startswith("-"):
-                try:
-                    _path(self.workspace, item)
-                except ToolError:
-                    return False
-        if parts[0] == "ls":
-            return all(
-                not item.startswith("-") or item in {
-                    "-v", "-t", "-a", "-l", "-la", "-al", "-h", "-lah", "-alh"
-                }
-                for item in parts[1:]
-            )
-        if parts[0] in {"pwd", "find"}:
-            return all(not item.startswith("-") or item in {"-v", "-t"} for item in parts[1:])
-        if parts[0] in {"python", "python3"}:
-            if parts[1:] in [["--version"], ["-V"]]:
-                return True
-            return (len(parts) >= 3 and parts[1:3] in [["-m", "unittest"], ["-m", "pytest"]]
-                    and all(not x.startswith("-") or x in {"-v", "-q", "-s", "-p", "-t"} for x in parts[3:]))
-        if parts[0] == "pytest":
-            return all(not item.startswith("-") or item in {"-v", "-q"} for item in parts[1:])
-        if parts[0] == "git":
-            return (
-                len(parts) >= 2
-                and parts[1] in {"status", "diff"}
-                and all(
-                    not item.startswith("-") or item in {"--", "--stat", "--check"}
-                    for item in parts[2:]
-                )
-            )
-        return False
 
     def _collect(self, process: subprocess.Popen[bytes]) -> tuple[str, str, bool]:
         selector = selectors.DefaultSelector()

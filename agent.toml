@@ -4,3 +4,36 @@ model = 20
 tools = 40
 effects = 15
 result = 120000
+
+# Политика по имени инструмента. ask — разрешение на один вызов.
+[permissions]
+list_files = "allow"
+read_file = "allow"
+write_file = "ask"
+delete_file = "ask"
+bash = "ask"
+run_tests = "allow"
+
+# Правила по аргументам. При совпадении: deny > ask > allow.
+# Без совпадения используется [permissions]. Префикс сравнивается по argv.
+[[permission_rules]]
+tool = "bash"
+mode = "allow"
+command_prefix = "python3 -m pytest"
+cwd = "."
+
+[[permission_rules]]
+tool = "bash"
+mode = "allow"
+command_prefix = "python3 -m unittest"
+cwd = "."
+
+[[permission_rules]]
+tool = "bash"
+mode = "allow"
+command = "python3 --version"
+
+[[permission_rules]]
+tool = "bash"
+mode = "allow"
+command = "python3 -V"

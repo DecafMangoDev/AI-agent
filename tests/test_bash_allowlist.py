@@ -1,4 +1,4 @@
-"""Explicitly permitted diagnostic commands and their execution boundaries."""
+"""Bash execution boundaries; command permissions live in runtime policy."""
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,14 +19,12 @@ class BashAllowlistTest(unittest.TestCase):
         self.store.create_run('diagnostics', str(self.root))
         self.registry = ToolRegistry(str(self.root), self.store, 'diagnostics')
 
-    def test_exact_python_version_forms(self):
-        for executable in ('python', 'python3'):
-            for flag in ('--version', '-V'):
-                with self.subTest(executable=executable, flag=flag):
-                    self.assertTrue(self.registry._allowed_argv([executable, flag]))
-                    self.assertFalse(self.registry._allowed_argv([executable, flag, 'script.py']))
-                    self.assertFalse(self.registry._allowed_argv([executable, flag, '-c', 'pass']))
-        self.assertFalse(self.registry._allowed_argv(['python3', '-m', 'unittest', '--version']))
+    def test_commands_are_not_restricted_by_name(self):
+        for command, expected in (("echo 123", "123\n"), ("python3 -c pass", "")):
+            with self.subTest(command=command):
+                result = self.registry.execute('bash', {'command': command})
+                self.assertEqual(result['exit_code'], 0, result)
+                self.assertEqual(result['stdout'], expected)
 
     def test_version_and_listing_execute_through_bash(self):
         (self.root / '.example').write_text('fixture')
@@ -48,7 +46,7 @@ class BashAllowlistTest(unittest.TestCase):
         commands = (
             'python3 --version && pwd', 'python3 -V; pwd',
             'python3 --version > version.txt', 'python3 -V | ls',
-            'python3 $(pwd)', 'python3 `pwd`', 'python3 -c pass',
+            'python3 $(pwd)', 'python3 `pwd`',
             'ls -la ../outside', 'ls -la /tmp', 'ls -la external/',
         )
         with patch('agent.tools.subprocess.Popen') as spawn:

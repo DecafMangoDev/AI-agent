@@ -17,12 +17,12 @@ The control project lives in `workspace/`. Do not modify its tests to make an ag
 
 Every tool has a name, description, JSON Schema, validation, and a registered executor. The minimum tool set is `list_files`, `read_file`, `write_file`, `delete_file`, and restricted `bash`.
 
-Bash runs inside the workspace with a timeout and bounded output. Reject redirects, pipes, command substitution, source-changing commands, and unsafe path arguments. Any allowlist expansion must be explicit and tested.
+Bash runs inside the workspace with a timeout and bounded output. Command authorization belongs to configured `ask`/`allow`/`deny` permissions and argument rules, not a hardcoded executor allowlist. Approved commands may change files; preserve change journaling. Reject redirects, pipes, command substitution, compound commands, and unsafe path arguments. These checks are not an OS sandbox for executed programs.
 
-Diagnostic allowlist: `python`/`python3` accept exactly `--version` or `-V`;
-`ls` also accepts `-a`, `-l`, `-la`, `-al`, `-h`, `-lah`, and `-alh`.
-Keep these forms covered by `tests/test_bash_allowlist.py`, including rejection
-before process creation of compound commands, extra version arguments and escaping paths.
+Keep Bash boundaries covered by `tests/test_bash_allowlist.py` (historical filename),
+including rejection before process creation of compound commands and escaping paths.
+Cover approved commands such as `echo 123` and commands outside the former allowlist;
+permission refusal and matching deny rules must still prevent process creation.
 
 ## State and recovery
 
@@ -81,3 +81,18 @@ Do not commit `.env`, SQLite databases, caches, virtual environments, or generat
 - Recovery must reconstruct missing messages and require explicit attribution of observed changes. Bash is not automatically retryable.
 
 Prefer `run_tests` for test requests. It invokes `python3 -m pytest` or `python3 -m unittest` directly; distinguish runner execution success from a nonzero test exit code. Keep test paths workspace-relative and validate them before execution.
+
+## Tool permissions
+
+- `[permissions]` configures exact tool names with `ask`, `allow`, or `deny`.
+- Enforce permissions in runtime before executor entry, including explicit retries.
+- `ask` without a UI callback denies execution. Persist decisions with call ID,
+  attempt and arguments; successful idempotent replays do not request approval again.
+- Tool permission never overrides Plan Mode, path checks or Bash validation.
+- Keep permission prompting in the CLI; acceptance of a task result remains separate.
+- `[[permission_rules]]` adds argument filters. All filters must match; matching
+  rules use deny > ask > allow, then fall back to the tool policy when none matches.
+- Bash command prefixes compare argv tokens, not raw string prefixes. Path patterns
+  match normalized workspace-relative paths with symlinks resolved.
+- Keep matched rule data in permission decisions and cover precedence, argument
+  boundaries, path normalization and executor restrictions in regression tests.

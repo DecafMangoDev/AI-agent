@@ -27,17 +27,110 @@ python3 -m agent --workspace workspace
 
 The interactive CLI uses `prompt-toolkit` for Unicode-aware editing, including Cyrillic input and backspace. Normal conversation is answered directly; coding and workspace work uses tools selected by the model.
 
-Available tools are `list_files`, `read_file`, `write_file`, `delete_file`, and restricted `bash`. Paths are resolved inside the workspace. Bash rejects shell features that could bypass the change journal, such as pipes, redirects, command substitution, and source-changing commands.
+Available tools are `list_files`, `read_file`, `write_file`, `delete_file`, `run_tests`, and `bash`. Bash command permissions come from `ask`/`allow`/`deny` policies and argument rules; there is no built-in list of permitted command names or flags. For example, approving `echo 123` executes it without a second allowlist check. Workspace path checks, timeout, output limits and change journaling still apply. Pipes, redirects, command substitution and compound commands are rejected.
 
-For environment diagnostics, Bash accepts `python3 --version`, `python3 -V`
-(and the same forms with `python`), `pwd`, and `ls` with `-a`, `-l`, `-la`,
-`-al`, `-h`, `-lah`, or `-alh`. Prefer `python3`: `python` may not be installed.
-Version commands accept no extra arguments. `unittest --version` is not supported;
+For environment diagnostics, use commands such as `python3 --version`, `python3 -V`,
+`pwd`, and `ls -lah`. Prefer `python3`: `python` may not be installed.
+`unittest --version` is not supported by the runner;
 unittest is part of the Python standard library, so check the Python version.
 Submit each command as a separate tool call; `&&` remains forbidden. These Bash
 diagnostics, like other Bash commands, are blocked until plan approval.
 
 ## Chat commands
+
+Tool permissions are configured by exact tool name in `agent.toml`:
+
+```toml
+[permissions]
+list_files = "allow"
+read_file = "allow"
+write_file = "ask"
+delete_file = "ask"
+bash = "ask"
+run_tests = "allow"
+```
+
+`allow` executes without a permission question; `deny` returns a tool error without
+execution; `ask` displays the tool and its arguments and asks `[y/N]` before each
+new attempt. Permission approval and acceptance of a task result are separate
+decisions. Plan Mode, path validation and Bash syntax checks still apply to allowed
+tools. `run_tests` executes project code and may create files, even when its policy
+is `allow`.
+
+Decisions are recorded in SQLite `decisions` as `tool_permission`, including the
+call ID, attempt, arguments, policy and answer. Successful cached calls do not ask
+again. Explicit retries check the current policy and ask again when required.
+Reloading the CLI (or selecting a saved run with `/resume`) reads the config again.
+Unspecified known tools default to `allow` for compatibility with older configs.
+Unknown tool names and policy values in the config are rejected.
+
+The core API accepts `permissions={"write_file": "ask"}` and a
+`permission_prompt(name, arguments) -> bool` callback. Without a callback, `ask`
+denies execution. Refused calls consume the already reserved tool/effect budget,
+and their error results count toward the result budget.
+
+For argument-specific policies, append repeated `[[permission_rules]]` sections:
+
+```toml
+# Fall back to asking for Bash commands that match no rule.
+[permissions]
+bash = "ask"
+
+[[permission_rules]]
+tool = "bash"
+mode = "allow"
+command_prefix = "python3 -m pytest"
+cwd = "."
+
+[[permission_rules]]
+tool = "bash"
+mode = "deny"
+command_prefix = "git"
+
+[[permission_rules]]
+tool = "write_file"
+mode = "ask"
+path = "src/*"
+
+[[permission_rules]]
+tool = "run_tests"
+mode = "ask"
+runner = "pytest"
+cwd = "integration"
+```
+
+Edit the existing `[permissions]` section rather than adding a second one.
+The shipped config allows `python3 -m pytest` and `python3 -m unittest` from
+the workspace root, plus the exact Python version commands. Other Bash calls
+still ask. The deny/ask rules above are customization examples.
+
+Each rule requires `tool`, `mode` and at least one filter. All filters within a
+rule must match. Among matching rules, **deny > ask > allow**, regardless of order;
+the first rule breaks ties. When no rule matches, `[permissions]` is the fallback.
+Thus a specific allow rule can override a fallback deny, but cannot override a
+matching deny rule. The matched rule is stored with the permission decision.
+
+| Filter | Meaning |
+|---|---|
+| `command` (Bash) | Exact argv after shell quoting/whitespace is parsed; no extra arguments |
+| `command_prefix` (Bash) | Whole leading argv tokens; extra arguments allowed subject to syntax and path checks |
+| `cwd` (Bash, run_tests) | Workspace-relative directory pattern; omitted or empty cwd means `.` |
+| `path` (file tools, run_tests) | Workspace-relative path pattern; a run_tests target is resolved relative to its cwd |
+| `runner` (run_tests) | Exact runner name: `pytest` or `unittest` |
+
+Use either `command` or `command_prefix` in a rule, never both. Paths are normalized
+and symlinks resolved before matching; absolute/outside paths are denied. Path
+patterns support shell-style `*`, `?` and `[abc]`; `*` also spans directory separators.
+Use canonical relative patterns (e.g. `src/*`, not `./src/*`). Command filters use
+literal tokens, not wildcard patterns. Compound commands and shell expansion are
+denied, and an allow rule does not bypass path checks or Plan Mode.
+Rules for `run_tests` and Bash are independent: to restrict test execution
+through both tools, configure both policies.
+
+The config parser supports single-line quoted string fields in these sections.
+Invalid fields, tool names and modes are rejected. Core callers can supply a list
+of the same rule dictionaries via `permission_rules=[...]`; no CLI session-wide
+approval mechanism is added.
 
 ```text
 /new                              start a new chat
@@ -211,7 +304,7 @@ Rollback checks all recorded final hashes and path types before writing. Unresol
 
 ## Execution boundaries and remaining limitations
 
-Use Python 3.9+ and a POSIX environment with `/bin/bash` (WSL on Windows). Bash receives a quoted, validated argv through an explicit Bash process. Output is capped and marked truncated. Tests execute with the operating-system privileges of the agent: the allowlist is not a sandbox for untrusted Python code.
+Use Python 3.9+ and a POSIX environment with `/bin/bash` (WSL on Windows). Bash receives a quoted argv through an explicit Bash process. Output is capped and marked truncated. Approved commands and tests execute with the operating-system privileges of the agent. Permission rules and path checks are not an OS sandbox: scripts and program-specific options can access files outside the workspace. The change journal and rollback cover only workspace files.
 
 Journal exclusions are `.git` and the exact configured SQLite state file with its WAL/SHM companions. User `.db` files and nested `.agent` project data are journaled. Keep runtime state in the default `.agent` directory.
 

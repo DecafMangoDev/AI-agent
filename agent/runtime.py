@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .client import ModelClient, ToolCall
+from .config import validate_permissions
+from .permissions import select_permission, validate_rules
 from .storage import Store
 from .tools import ToolError, ToolRegistry, _hash, _path
 
@@ -36,6 +38,9 @@ class AgentRuntime:
         limits: Optional[Dict[str, int]] = None,
         progress: Optional[Callable[[str], None]] = None,
         review: Optional[Callable[[str, Dict[str, Any]], Tuple[bool, str]]] = None,
+        permissions: Optional[Dict[str, str]] = None,
+        permission_prompt: Optional[Callable[[str, Dict[str, Any]], bool]] = None,
+        permission_rules: Optional[List[Dict[str, str]]] = None,
     ):
         self.client = client
         self.store = store
@@ -47,6 +52,29 @@ class AgentRuntime:
         self.limits = limits or DEFAULT_LIMITS.copy()
         self.progress = progress or (lambda _message: None)
         self.review = review
+        self.permissions = validate_permissions(permissions or {})
+        self.permission_prompt = permission_prompt
+        self.permission_rules = validate_rules(permission_rules or [])
+
+    def _authorize_tool(self, call: ToolCall, attempt: int, plan_mode: bool) -> None:
+        if plan_mode and call.name in {"write_file", "delete_file", "bash", "run_tests"}:
+            raise ToolError("side effects are forbidden before plan approval")
+        mode, rule_index = select_permission(
+            call.name, call.arguments, self.permissions.get(call.name, "deny"),
+            self.permission_rules, self.workspace,
+        )
+        accepted = mode == "allow"
+        if mode == "ask" and self.permission_prompt is not None:
+            # The UI receives a copy so it cannot change the arguments being authorized.
+            accepted = self.permission_prompt(call.name, json.loads(json.dumps(call.arguments))) is True
+        self.store.add_decision(self.run_id, "tool_permission", json.dumps({
+            "call_id": call.id, "attempt": attempt, "tool": call.name,
+            "arguments": call.arguments, "policy": mode, "accepted": accepted,
+            "rule": self.permission_rules[rule_index - 1] if rule_index else None,
+        }, ensure_ascii=False))
+        if not accepted:
+            reason = "ask requires an interactive approval callback" if mode == "ask" and self.permission_prompt is None else "execution denied"
+            raise ToolError("permission denied for {}: {}".format(call.name, reason))
 
     def _progress(self, message: str) -> None:
         """Publish a short event for interactive clients without coupling core to stdout."""
@@ -425,6 +453,7 @@ class AgentRuntime:
         if budget["result_limit"] - budget["result_used"] < 36:
             raise ToolError("result budget exhausted before execution")
         try:
+            self._authorize_tool(call, attempt, plan_mode)
             result = registry.execute(call.name, call.arguments, plan_mode)
         except InjectedFault:
             raise
