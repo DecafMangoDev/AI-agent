@@ -18,9 +18,19 @@ Use workspace tools only when the user asks to work with code, files, commands, 
 Do not inspect the workspace for greetings or general questions. Do not change tests.
 Paths must be relative to the workspace. Execute actions using actual tool_calls, never JSON/XML in text.
 Use real newline characters in file content, not literal backslash-n separators.
-After changing code, run the project's tests through bash. A write result does not prove correctness.
+After changing code, run the project's tests, preferably through run_tests. A write result does not prove correctness.
 Only report completion after checking results; describe failures honestly."""
-PLAN_SYSTEM = """You are a coding agent planner. Use read-only tools only. Return final JSON with goal, steps (objects with id, description, tools, depends_on), risks, assumptions, and ready_when. tools must be a list of tool names, never embedded arguments or source code. For code changes include a final dependent bash verification step. ready_when must include passing tests, not merely writing a file."""
+PLAN_SYSTEM = """You are a coding agent planner. Use read-only tools only until approval.
+Return a final JSON object without Markdown fences. Required fields:
+goal: nonempty string; ready_when: nonempty string describing passing tests;
+risks and assumptions: arrays of strings;
+steps: nonempty array of objects with id (unique string), description (nonempty string),
+tools (array of exact registered tool names), depends_on (array of existing step IDs).
+Use bare tool names from the supplied definitions, e.g. ["write_file", "run_tests"].
+Never add a functions. prefix, embedded arguments, calls, or source code to tools.
+Do not change tests. For code changes include a final dependent verification step,
+preferably using run_tests. Planning a changing tool is allowed; executing it awaits approval.
+ready_when must describe passing tests, not merely writing a file."""
 DEFAULT_LIMITS = {"model": 20, "tools": 40, "effects": 15, "result": 120000}
 
 
@@ -153,8 +163,6 @@ class AgentRuntime:
             raise RuntimeError("cannot continue a {} run".format(row["status"]))
         if self._unresolved():
             raise ToolError("resolve interrupted calls before continuing")
-        if self.store.tasks(self.run_id) and all(t["status"] == "done" for t in self.store.tasks(self.run_id)):
-            self.store.add_task(self.run_id, "followup_" + uuid.uuid4().hex[:8], prompt, [])
         self.store.update_run(self.run_id, status="active", phase="executing", error=None)
         self.store.add_message(self.run_id, "user", {"role": "user", "content": prompt})
         self._progress("[run {}] continuing request".format(self.run_id[:8]))
@@ -205,13 +213,18 @@ class AgentRuntime:
             deps = step.get("depends_on", [])
             if not isinstance(deps, list) or any(not isinstance(dep, str) for dep in deps):
                 raise ToolError("depends_on must be a list of task IDs")
-        allowed = {"list_files", "read_file", "write_file", "delete_file", "bash"}
+        registry = ToolRegistry(self.workspace, self.store, self.run_id)
+        allowed = {item["function"]["name"] for item in registry.definitions()}
         for step in steps:
             if not isinstance(step.get("description"), str) or not step["description"].strip():
                 raise ToolError("task description must be text")
             tools = step.get("tools")
             if not isinstance(tools, list) or any(not isinstance(tool, str) or tool not in allowed for tool in tools):
-                raise ToolError("step tools must contain registered tool names, not embedded calls")
+                raise ToolError(
+                    "step tools must be an array of exact registered tool names: {}. "
+                    "Use bare names without functions. prefixes, arguments or embedded calls; got {!r}"
+                    .format(", ".join(sorted(allowed)), tools)
+                )
         known = set(ids)
         if any(dep not in known for step in steps for dep in step.get("depends_on", [])):
             raise RuntimeError("plan contains unknown dependency")
@@ -251,7 +264,8 @@ class AgentRuntime:
                         "role": "user",
                         "content": (
                             "Plan rejected by the runtime: {}. Return corrected plan JSON. "
-                            "Each step must have a unique string id, and depends_on must "
+                            "ready_when must be a nonempty string, risks and assumptions must be "
+                            "arrays of strings. Each step must have a unique string id, and depends_on must "
                             "reference existing ids."
                         ).format(last_error),
                     },
@@ -281,10 +295,12 @@ class AgentRuntime:
             if call["status"] != "succeeded":
                 continue
             args = json.loads(call["args_json"])
+            result = json.loads(call["result_json"] or "{}")
             if call["name"] in {"write_file", "delete_file"} and args.get("path", "").endswith(".py"):
                 changed = call["sequence"]
             if (call["name"] == "run_tests" and args.get("runner") in {"unittest", "pytest"}) or (call["name"] == "bash" and any(x in args.get("command", "") for x in ("unittest", "pytest"))):
-                checked = call["sequence"]
+                if result.get("exit_code") == 0 and not result.get("timed_out"):
+                    checked = call["sequence"]
         return changed > checked
 
     def _loop(self, plan_mode: bool) -> str:
@@ -292,7 +308,7 @@ class AgentRuntime:
         idle_turns = 0
         while True:
             if not plan_mode and self._verification_needed() and self.store.tasks(self.run_id) and all(t["status"] == "done" for t in self.store.tasks(self.run_id)):
-                self.store.add_task(self.run_id, "verify_" + uuid.uuid4().hex[:8], "Run project tests using bash and confirm they pass", [])
+                self.store.add_task(self.run_id, "verify_" + uuid.uuid4().hex[:8], "Run project tests using run_tests and confirm they pass", [])
             self.store.reserve(self.run_id, "model")
             self._progress(
                 "[run {}] model request; remaining: {}".format(
@@ -303,7 +319,7 @@ class AgentRuntime:
             # Phase instructions are derived from persisted state, never inherited from an old plan.
             messages = [m for m in messages if m["role"] != "system"]
             messages.insert(0, {"role": "system", "content": PLAN_SYSTEM if plan_mode else SYSTEM})
-            if not plan_mode and self.store.tasks(self.run_id):
+            if not plan_mode and any(t["status"] != "done" for t in self.store.tasks(self.run_id)):
                 messages.insert(1, {"role": "system", "content": "Task state: " + json.dumps([
                     {"id": t["task_id"], "description": t["description"], "status": t["status"]}
                     for t in self.store.tasks(self.run_id)
@@ -321,6 +337,15 @@ class AgentRuntime:
                 ]
             self.store.add_message(self.run_id, "assistant", assistant)
             if not turn.tool_calls:
+                if not plan_mode and not turn.content.strip():
+                    idle_turns += 1
+                    if idle_turns > 3:
+                        raise ToolError("model returned empty final responses")
+                    self.store.add_message(self.run_id, "user", {
+                        "role": "user",
+                        "content": "Your response was empty. Provide a nonempty answer or use a tool if work remains.",
+                    })
+                    continue
                 if not plan_mode and any(marker in turn.content for marker in ('"write_file"', '"arguments"', '<tool_call', '"action"')):
                     idle_turns += 1
                     if idle_turns > 3:
@@ -331,7 +356,7 @@ class AgentRuntime:
                     idle_turns += 1
                     if idle_turns > 3:
                         raise ToolError("code changes require successful tests before completion")
-                    self.store.add_message(self.run_id, "user", {"role": "user", "content": "Code changed but tests have not passed since the last write. Call bash to run the project tests; fix failures before finishing."})
+                    self.store.add_message(self.run_id, "user", {"role": "user", "content": "Code changed but tests have not passed since the last write. Call run_tests to run the project tests; fix failures before finishing."})
                     continue
                 candidate = self.store.task_candidate(self.run_id) if not plan_mode else None
                 if candidate is not None:
@@ -368,6 +393,22 @@ class AgentRuntime:
             effects = sum(
                 call.name in {"write_file", "delete_file", "bash", "run_tests"} for call in turn.tool_calls
             )
+            tasks = self.store.tasks(self.run_id)
+            if not plan_mode and tasks and all(t["status"] == "done" for t in tasks):
+                new_work = any(
+                    call.name in {"write_file", "delete_file", "bash", "run_tests"}
+                    and not (
+                        self.store.call(self.run_id, call.id)
+                        and self.store.call(self.run_id, call.id)["status"] == "succeeded"
+                    )
+                    for call in turn.tool_calls
+                )
+                if new_work:
+                    prompt = next(
+                        m["content"] for m in reversed(self.store.messages(self.run_id))
+                        if m["role"] == "user"
+                    )
+                    self.store.add_task(self.run_id, "followup_" + uuid.uuid4().hex[:8], prompt, [])
             starts = []
             for call in turn.tool_calls:
                 prior = self.store.call(self.run_id, call.id)
@@ -378,7 +419,7 @@ class AgentRuntime:
                     raise ToolError("unknown tool call requires explicit resolve")
                 if not prior or prior["status"] != "succeeded":
                     task_id = prior["task_id"] if prior else self._current_task_id()
-                    if self.store.tasks(self.run_id) and task_id is None:
+                    if any(t["status"] != "done" for t in self.store.tasks(self.run_id)) and task_id is None:
                         raise ToolError("task dependencies are not satisfied")
                     starts.append(
                         (
@@ -431,7 +472,7 @@ class AgentRuntime:
                 raise ToolError("unknown tool call requires explicit resolve")
         attempt = 1 if not prior else int(prior["attempt"]) + 1
         task_id = prior["task_id"] if prior else self._current_task_id()
-        if self.store.tasks(self.run_id) and task_id is None:
+        if any(t["status"] != "done" for t in self.store.tasks(self.run_id)) and task_id is None:
             raise ToolError("task dependencies are not satisfied")
         already_started = bool(prior and prior["status"] == "started" and not force_retry)
         if already_started:
@@ -461,7 +502,12 @@ class AgentRuntime:
             result = {"error": str(exc)}
             status = "failed"
         else:
-            status = "failed" if result.get("timed_out") or result.get("exit_code", 0) != 0 else "succeeded"
+            # A completed diagnostic is successful even when it reports failing tests.
+            # Passing tests remain a separate completion requirement.
+            failed = result.get("timed_out") or (
+                call.name != "run_tests" and result.get("exit_code", 0) != 0
+            )
+            status = "failed" if failed else "succeeded"
         with self.store.transaction():
             result = self._fit_result(result)
             self.store.record_call(
@@ -480,7 +526,6 @@ class AgentRuntime:
             tool_names = [t if isinstance(t, str) else t.get("name") for t in step.get("tools", [])]
             if "bash" in tool_names or "run_tests" in tool_names or (task_id and task_id.startswith("verify_")):
                 eligible = call.name in {"bash", "run_tests"}
-                eligible = call.name == "bash"
             if task_id and status == "succeeded" and eligible:
                 self.store.task_progress(self.run_id, task_id, call.id)
                 self._progress("[run {}] task {} is awaiting review".format(self.run_id[:8], task_id))
